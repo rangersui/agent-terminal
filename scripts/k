@@ -34,8 +34,8 @@ JSON output (-j / fire / poll):
   error:        {"status": "error", "output": "..."}
   cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 
-  Errors without cell_id: no session, active cell, pipe failed, no active cell
-  Errors with cell_id:    interrupted, unknown cell, watcher died
+  Errors without cell_id: no session, active cell, pipe failed, send failed, no active cell
+  Errors with cell_id:    interrupted, unknown cell, watcher died, lock update failed, interrupt failed
 
 Timeout: lock is NOT released (command may still be running).
   Only k int or k kill releases. k int sends ctrl-c, writes interrupted, releases lock.
@@ -137,6 +137,40 @@ def _resolve(explicit=None):
 
 def _json(d): print(json.dumps(d, ensure_ascii=False))
 
+def _emit(json_out, data, text=None):
+    """Unified output: JSON mode → _json(data), text mode → print(text)."""
+    if json_out: _json(data)
+    else: print(text if text is not None else data.get("output", ""))
+
+def _kill_watcher(meta):
+    """SIGTERM bg watcher if present. Returns True if killed."""
+    if "bg_pid" not in meta: return False
+    try: os.kill(meta["bg_pid"], signal.SIGTERM)
+    except OSError: return False
+    return True
+
+def _write_result(session, cell_id, result):
+    """Atomic result write: tmp + fsync + os.replace. No partial reads."""
+    rpath = _result(session, cell_id)
+    tmp = rpath + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(result, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, rpath)
+
+def _update_lock(session, **kw):
+    """Read-modify-write lock file. Returns True on success, False on failure."""
+    try:
+        with open(_lock(session), "r+") as f:
+            meta = json.load(f)
+            meta.update(kw)
+            f.seek(0); f.truncate()
+            json.dump(meta, f)
+        return True
+    except Exception:
+        return False
+
 _SAFE_NAME = re.compile(r'^[A-Za-z0-9_.-]+$')
 def _validate_name(s):
     """Reject path traversal / injection in session names."""
@@ -196,6 +230,77 @@ def _release(session, cell_id):
         with open(_lock(session)) as f:
             if json.load(f).get("cell_id") == cell_id: os.unlink(_lock(session))
     except: pass
+
+
+def _send_interrupt(session):
+    """Send Ctrl-C to REPL + re-send frame enters in repeat mode.
+    Returns True if Ctrl-C was delivered (or session is already dead).
+    Returns False if Ctrl-C failed but session is still alive — caller must not release.
+    """
+    prompt = _session_prompt(session)
+    try:
+        T.send_int(session)
+    except Exception:
+        # Ctrl-C didn't reach REPL. If session is dead, nothing is running → safe.
+        # If session is alive, command may still be running → unsafe to release.
+        return not T.has(session)
+    time.sleep(0.3)
+    # re-frame is best-effort (Ctrl-C already delivered)
+    if not prompt:
+        try:
+            _send_frame_enters(session)
+        except Exception:
+            pass
+    return True
+
+
+class CellBusy(Exception):
+    """Raised by CellLock when the session already has an active cell."""
+    def __init__(self, held_id):
+        self.held_id = held_id
+
+
+class CellLock:
+    """RAII lock for cell lifecycle. Three states via sent/keep:
+      pre-send (default)  → release on any exit
+      post-send (sent)    → interrupt recovery on exception, release on normal exit
+      keep (timeout/fire) → lock stays held, no cleanup
+    """
+    def __init__(self, session, cell_id, log_offset, echo_count):
+        self.session = session
+        self.cell_id = cell_id
+        self.sent = False
+        self.keep = False
+        self.interrupt_failed = False
+        held = _acquire(session, cell_id, log_offset, echo_count)
+        if held:
+            raise CellBusy(held)
+
+    def __enter__(self):
+        return self
+
+    def mark_sent(self):
+        self.sent = True
+
+    def mark_keep(self):
+        self.keep = True
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.keep:
+            return False
+        if exc_type is not None and self.sent:
+            if not _send_interrupt(self.session):
+                # Ctrl-C didn't reach REPL but session is alive — keep lock
+                # (same reasoning as timeout: command may still be running)
+                self.interrupt_failed = True
+                return False
+        _release(self.session, self.cell_id)
+        # sync mode cleanup: remove result file (nobody will poll it)
+        try:
+            rpath = _result(self.session, self.cell_id)
+            if os.path.exists(rpath): os.unlink(rpath)
+        except OSError: pass
+        return False
 
 
 # ═══════════════════════════════════════════
@@ -315,8 +420,7 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
         "output": "" if timed_out else "\n".join(output)
     }
 
-    with open(_result(session, cell_id), "w") as f:
-        json.dump(result, f)
+    _write_result(session, cell_id, result)
     if not timed_out:
         _log_event(session, f"── cell:{cell_id} done ──")
 
@@ -332,6 +436,14 @@ def _echo_count(code):
     return count
 
 
+def _send_frame_enters(session):
+    """Send FRAME_ENTERS empty Enters via send-keys (repeat-mode framing)."""
+    args = [TMUX, "send-keys", "-t", session]
+    for _ in range(FRAME_ENTERS):
+        args.extend(["", "Enter"])
+    subprocess.run(args, check=True)
+
+
 def _send_code(session, code, prompt=None):
     """Send code via paste-buffer (no per-char echo) + frame enters."""
     code_lines = code.lstrip().split("\n")
@@ -343,11 +455,7 @@ def _send_code(session, code, prompt=None):
     subprocess.run([TMUX, "paste-buffer", "-b", buf, "-d", "-t", session], check=True)
 
     if not prompt:
-        # frame enters still via send-keys (empty Enters, no echo issue)
-        args = [TMUX, "send-keys", "-t", session]
-        for _ in range(FRAME_ENTERS):
-            args.extend(["", "Enter"])
-        subprocess.run(args, check=True)
+        _send_frame_enters(session)
 
 
 # ═══════════════════════════════════════════
@@ -384,44 +492,47 @@ def cmd_fire(session, code, timeout=300):
     cell_id = uuid.uuid4().hex[:12]
     prompt = _session_prompt(session)
     echo_count = _echo_count(code)
-
-    # lock BEFORE any side effects — rejected fire = zero touch
     log_offset = _log_size(session)
-    held = _acquire(session, cell_id, log_offset, echo_count)
-    if held:
-        _json({"status": "error", "output": f"active cell '{held}'"}); return 1
-
-    # pipe restart only after we own the lock
-    try:
-        _ensure_pipe(session)
-    except Exception as e:
-        _release(session, cell_id)
-        _json({"status": "error", "output": f"pipe failed: {e}"}); return 1
 
     try:
-        _send_code(session, code, prompt)
-    except Exception as e:
-        _release(session, cell_id)
-        _json({"status": "error", "output": f"send failed: {e}"}); return 1
+        lock = CellLock(session, cell_id, log_offset, echo_count)
+    except CellBusy as e:
+        _json({"status": "error", "output": f"active cell '{e.held_id}'"}); return 1
 
-    _log_event(session, f"── cell:{cell_id} fired ──")
-
-    bg_args = [sys.executable, os.path.abspath(__file__), "_bg",
-               session, cell_id, str(log_offset), str(echo_count), str(timeout)]
-    if prompt:
-        bg_args.append(prompt)
-
-    bg = subprocess.Popen(bg_args, start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # store bg PID in lock for orphan detection
     try:
-        with open(_lock(session), "r+") as f:
-            meta = json.load(f)
-            meta["bg_pid"] = bg.pid
-            f.seek(0); f.truncate()
-            json.dump(meta, f)
-    except: pass
+        with lock:
+            try:
+                _ensure_pipe(session)
+            except Exception as e:
+                _json({"status": "error", "output": f"pipe failed: {e}"}); return 1
+
+            try:
+                _send_code(session, code, prompt)
+            except Exception as e:
+                _json({"status": "error", "output": f"send failed: {e}"}); return 1
+
+            lock.mark_sent()
+            _log_event(session, f"── cell:{cell_id} fired ──")
+
+            bg_args = [sys.executable, os.path.abspath(__file__), "_bg",
+                       session, cell_id, str(log_offset), str(echo_count), str(timeout)]
+            if prompt:
+                bg_args.append(prompt)
+
+            bg = subprocess.Popen(bg_args, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # store bg PID in lock — without it orphan detection is blind
+            if not _update_lock(session, bg_pid=bg.pid):
+                try: bg.kill()
+                except OSError: pass
+                raise RuntimeError("lock update failed")
+
+            lock.mark_keep()  # bg process owns the lock now
+    except (Exception, KeyboardInterrupt):
+        msg = "interrupt failed; use k kill" if lock.interrupt_failed else "interrupted"
+        _json({"cell_id": cell_id, "status": "error", "output": msg})
+        return 1
 
     _json({"cell_id": cell_id, "status": "fired"})
     return 0
@@ -438,21 +549,24 @@ def cmd_poll(session, cell_id=None):
     if os.path.exists(rpath):
         try:
             with open(rpath) as f: result = json.load(f)
-            os.unlink(rpath)
-            if result.get("status") == "timeout":
-                # mark lock so subsequent polls don't orphan-release
-                try:
-                    with open(_lock(session), "r+") as f:
-                        lmeta = json.load(f)
-                        lmeta["timed_out"] = True
-                        f.seek(0); f.truncate()
-                        json.dump(lmeta, f)
-                except: pass
-            else:
-                _release(session, cell_id)
-            _json(result)
+        except (json.JSONDecodeError, OSError):
+            # atomic writes make this near-impossible; if it happens,
+            # do NOT release lock — state is unknown, let user k int / k kill
+            _json({"cell_id": cell_id, "status": "running"})
             return 0
-        except: pass
+            return 1
+        if result.get("status") == "timeout":
+            # mark lock BEFORE consuming result — if this fails, keep result for retry
+            if not _update_lock(session, timed_out=True):
+                _json({"cell_id": cell_id, "status": "error", "output": "lock update failed; use k int or k kill"})
+                return 1
+        # safe to consume result now (timed_out written, or non-timeout)
+        try: os.unlink(rpath)
+        except OSError: pass
+        if result.get("status") != "timeout":
+            _release(session, cell_id)
+        _json(result)
+        return 0
 
     # check lock state
     meta = _load_cell(session)
@@ -486,67 +600,46 @@ def cmd_poll(session, cell_id=None):
 
 def cmd_run(session, code, timeout=30, json_out=False):
     if not _session_exists(session):
-        if json_out: _json({"status": "error", "output": f"no session '{session}'"})
-        else: print(f"ERR no session '{session}'")
+        _emit(json_out, {"status": "error", "output": f"no session '{session}'"})
         return 1
 
     prompt = _session_prompt(session)
     cell_id = uuid.uuid4().hex[:12]
     echo_count = _echo_count(code)
-
-    # lock BEFORE any side effects — rejected run = zero touch
     log_offset = _log_size(session)
-    held = _acquire(session, cell_id, log_offset, echo_count)
-    if held:
-        if json_out: _json({"status": "error", "output": f"active cell '{held}'"})
-        else: print(f"ERR active cell '{held}'")
+
+    try:
+        lock = CellLock(session, cell_id, log_offset, echo_count)
+    except CellBusy as e:
+        _emit(json_out, {"status": "error", "output": f"active cell '{e.held_id}'"})
         return 1
 
-    # pipe restart only after we own the lock
     try:
-        _ensure_pipe(session)
-    except Exception as e:
-        _release(session, cell_id)
-        if json_out: _json({"status": "error", "output": f"pipe failed: {e}"})
-        else: print(f"ERR pipe failed: {e}")
-        return 1
+        with lock:
+            try:
+                _ensure_pipe(session)
+            except Exception as e:
+                _emit(json_out, {"status": "error", "output": f"pipe failed: {e}"})
+                return 1
 
-    # send failure before REPL executes → safe to release
-    try:
-        _send_code(session, code, prompt)
-    except Exception as e:
-        _release(session, cell_id)
-        if json_out: _json({"status": "error", "output": f"send failed: {e}"})
-        else: print(f"ERR send failed: {e}")
-        return 1
+            try:
+                _send_code(session, code, prompt)
+            except Exception as e:
+                _emit(json_out, {"status": "error", "output": f"send failed: {e}"})
+                return 1
 
-    # after send: REPL is executing. interrupt/exception → k int equivalent
-    # (do NOT just release — command may still be running, same as timeout)
-    try:
-        result = _stream_process(session, cell_id, log_offset, echo_count, timeout, prompt)
+            lock.mark_sent()
+            result = _stream_process(session, cell_id, log_offset, echo_count, timeout, prompt)
+
+            if result.get("status") == "timeout":
+                lock.mark_keep()
     except (Exception, KeyboardInterrupt):
-        # REPL command may still be running — send Ctrl-C + write interrupted + release
-        try:
-            T.send_int(session)
-            time.sleep(0.3)
-            if not prompt:
-                args = [TMUX, "send-keys", "-t", session]
-                for _ in range(FRAME_ENTERS):
-                    args.extend(["", "Enter"])
-                subprocess.run(args, check=True)
-        except Exception: pass
-        rpath = _result(session, cell_id)
-        with open(rpath, "w") as f:
-            json.dump({"cell_id": cell_id, "status": "error", "output": "interrupted"}, f)
-        _release(session, cell_id)
-        raise
+        # CellLock.__exit__ handled cleanup (interrupt recovery or lock kept)
+        msg = "interrupt failed; use k kill" if lock.interrupt_failed else "interrupted"
+        _emit(json_out, {"cell_id": cell_id, "status": "error", "output": msg})
+        return 1
 
-    if result.get("status") != "timeout":
-        _release(session, cell_id)
-    # timeout: lock kept — command may still be running, use k int / k kill
-
-    if json_out: _json(result)
-    else: print(result.get("output", ""))
+    _emit(json_out, result)
     return 0
 
 
@@ -561,38 +654,25 @@ def cmd_notify(session, message):
 
 
 def cmd_int(s):
-    T.send_int(s)
-    time.sleep(0.3)
-    # re-send frame enters only in repeat mode
-    # (in prompt/hook mode, empty Enters could have side effects — gdb repeats)
-    prompt = _session_prompt(s)
-    if not prompt:
-        args = [TMUX, "send-keys", "-t", s]
-        for _ in range(FRAME_ENTERS):
-            args.extend(["", "Enter"])
-        subprocess.run(args, check=True)
+    if not _send_interrupt(s):
+        print("ERR interrupt failed; use k kill"); return 1
     # kill bg watcher (if any) before releasing lock
     # prevents old watcher from consuming new cell's output
     meta = _load_cell(s)
     if meta:
         cell_id = meta["cell_id"]
-        if "bg_pid" in meta:
-            try: os.kill(meta["bg_pid"], signal.SIGTERM)
-            except OSError: pass
+        if _kill_watcher(meta):
             time.sleep(0.2)  # let watcher exit
         # write result so poll finds closure — overwrites timeout result too
-        rpath = _result(s, cell_id)
-        with open(rpath, "w") as f:
-            json.dump({"cell_id": cell_id, "status": "error", "output": "interrupted"}, f)
+        _write_result(s, cell_id, {"cell_id": cell_id, "status": "error", "output": "interrupted"})
         _release(s, cell_id)
     print("OK"); return 0
 
 def cmd_kill(s):
     # kill bg watcher if running
     meta = _load_cell(s)
-    if meta and "bg_pid" in meta:
-        try: os.kill(meta["bg_pid"], signal.SIGTERM)
-        except OSError: pass
+    if meta:
+        _kill_watcher(meta)
     T.pipe_stop(s); T.kill(s)
     d = os.path.join(CELL_DIR, s)
     if os.path.isdir(d): shutil.rmtree(d, ignore_errors=True)

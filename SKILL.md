@@ -152,8 +152,8 @@ error:        {"status": "error", "output": "..."}
 cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
-Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `no active cell on 'x'`.
-Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`.
+Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
+Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `interrupt failed; use k kill`.
 
 ## Safety Invariants
 
@@ -165,6 +165,7 @@ Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`.
 - tmux width 10000: prevents line wrapping that would skew echo_count.
 - Session names validated: `[A-Za-z0-9_.-]+`, no path traversal.
 - Pipe-pane restarted on every fire/run (idempotent, recovers dead pipes).
+- Result files written atomically (tmp + fsync + `os.replace`). poll never reads partial JSON.
 - k does not classify output. "done" = prompt appeared, not "command succeeded".
 
 ## Metadata on Disk
@@ -184,6 +185,8 @@ Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`.
 **echo_count heuristic**: assumes 1 sent line = 1 echoed line. Mitigated by tmux width 10000 (no wrapping) and continuation prompt filtering.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
+
+**Python 3.13+ `_pyrepl`**: The new Python REPL auto-indents pasted code, doubling indentation on multi-line blocks. Workaround: `k new py "env PYTHON_BASIC_REPL=1 python3 -i"`. Single-line code is unaffected.
 
 ## Python Multi-line
 

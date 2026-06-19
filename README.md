@@ -4,6 +4,8 @@ Structured async execution over PTY for AI agents. REPL-agnostic. Zero config.
 
 Agent fires code, polls for output, gets JSON. REPL stays alive between cells. Any readline prompt works.
 
+**Requires tmux 3.0+** — k drives tmux for PTY multiplexing; it does not bundle or replace it.
+
 ## Quick Start
 
 ```bash
@@ -11,9 +13,21 @@ k new work bash
 k run -j work "echo hello"
 # {"cell_id":"...","status":"done","output":"hello"}
 
-k new py python3 -i
+k new py python3 -i                         # Python 3.12 and below
+k new py "env PYTHON_BASIC_REPL=1 python3 -i"  # Python 3.13+ (disables _pyrepl auto-indent)
 k run -j py "print(42)"
 ```
+
+## Install
+
+```bash
+# requires: python 3.8+, tmux 3.0+
+git clone <repo> && cd agent-repl
+ln -sf "$(pwd)/scripts/k"  /usr/local/bin/k
+ln -sf "$(pwd)/scripts/km" /usr/local/bin/km
+```
+
+Or add `scripts/` to PATH: `export PATH="/path/to/agent-repl/scripts:$PATH"`
 
 ## Commands
 
@@ -79,6 +93,7 @@ k poll
 | ctrl-c safe | kills watcher, writes `{"status": "error", "output": "interrupted"}`, re-sends frame enters (repeat only) |
 | session name validation | `[A-Za-z0-9_.-]+`, no `..`, no path traversal |
 | idempotent pipe restart | pipe-pane replaced on every fire/run |
+| atomic result writes | tmp + fsync + `os.replace` — poll never reads partial JSON |
 | no output classification | "done" = prompt appeared, not success |
 
 ## JSON Schema (k)
@@ -93,8 +108,8 @@ error:        {"status": "error", "output": "..."}
 cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
-Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `no active cell on 'x'`.
-Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`.
+Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
+Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `interrupt failed; use k kill`.
 
 ## km — event monitor
 

@@ -69,9 +69,20 @@ for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
     for km_status in ("fired", "done", "notify", "closed", "error"):
         check(f"{doc_name}: km event '{km_status}'", f'"status": "{km_status}"' in text)
 
+# ── install + safety ──
+check("README.md: install section", "## Install" in README)
+check("README.md: requires python", "python" in README.lower() and "tmux" in README.lower())
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
+    check(f"{doc_name}: atomic result writes documented", "os.replace" in text)
+
+# ── k help text consistency ──
+for err in ("lock update failed", "interrupt failed"):
+    check(f"k help: error '{err}'", err in K_HELP)
+
 # ── k JSON error outputs ──
 for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
-    for err in ("unknown cell", "watcher died", "active cell", "pipe failed", "no active cell"):
+    for err in ("unknown cell", "watcher died", "active cell", "pipe failed", "send failed", "no active cell",
+                 "lock update failed", "interrupt failed"):
         check(f"{doc_name}: error output '{err}'", err in text)
     # cell errors (with cell_id) vs errors (without) are distinguished
     check(f"{doc_name}: cell error schema", "cell error" in text)
