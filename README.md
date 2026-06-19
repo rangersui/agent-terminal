@@ -2,7 +2,7 @@
 
 Structured async execution over PTY for AI agents. REPL-agnostic. Zero config.
 
-Agent fires code, polls for output, gets JSON. REPL stays alive between cells. Any readline prompt works. Frame delimiter = repeated prompt lines (no prompt detection needed).
+Agent fires code, polls for output, gets JSON. REPL stays alive between cells. Any readline prompt works.
 
 ## Quick Start
 
@@ -18,30 +18,45 @@ k run -j py "print(42)"
 ## Commands
 
 ```
-k new    <session> <cmd...> [--prompt="x"]  spawn
-k fire   [session] <code> [-t N]            async fire
-k poll   [session] [cell_id]                poll (O(1))
-k run    [session] <code>                   sync (fire+poll)
-k run -j [session] <code>                   sync, JSON
-k run -j -t N [session] <code>              sync, timeout
-k notify [session] <message>                notification
-k int    [session]                          ctrl-c + re-frame
-k kill   <session>                          cleanup
+k new    <session> <cmd...> [--prompt="x"]     spawn
+k new    <session> <cmd> --prompt=./hook        hook mode
+k fire   [session] <code> [-t N]               async fire
+k poll   [session] [cell_id]                   poll (O(1))
+k run    [session] <code>                      sync (lock + send + wait)
+k run -j [session] <code>                      sync, JSON
+k run -j -t N [session] <code>                 sync, timeout
+k notify [session] <message>                   notification
+k int    [session]                             ctrl-c
+k kill   <session>                             cleanup
 k ls / k status / k watch / k history
 ```
+
+## Frame Detection
+
+Three modes via `--prompt`:
+
+| --prompt= | mode | how |
+|-----------|------|-----|
+| *(not set)* | repeat | 5 empty Enters → 5 identical lines → done |
+| `"(gdb)"` | exact | match prompt string |
+| `./hook.py` | hook | stdin lines → hook exit → done |
+
+Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Path must contain `/`.
 
 ## How It Works
 
 ```
 k fire "echo hello"
   |
-  +-- sends: echo hello + 5 empty Enters (one tmux call, atomic)
-  +-- starts: background stream processor
+  +-- acquires lock (rejected fire = zero side effects)
+  +-- sends code via paste-buffer (atomic)
+  +-- sends 5 frame Enters (repeat mode only)
+  +-- starts background stream processor
   |
   stream processor tails log:
     ECHOING: skip echo_count lines
     OUTPUT:  collect lines
-    DONE:    5 consecutive identical lines (= prompt redrawn)
+    DONE:    5 identical lines / prompt match / hook exit
   |
   writes result file -> exits
   |
@@ -50,27 +65,19 @@ k poll
   +-- returns JSON
 ```
 
-## Architecture
-
-| component | role |
-|-----------|------|
-| pipe-pane | captures PTY output to log (lossless) |
-| batch send-keys | sends all code in one tmux call |
-| stream processor | state machine: ECHOING -> OUTPUT -> DONE |
-| bg watcher | one per cell, writes result, exits when done |
-| O_EXCL lock | one cell per session, stores bg PID |
-| frame enters | 5 empty Enters -> 5 identical prompt lines -> frame end |
-
 ## Safety
 
 | invariant | mechanism |
 |-----------|-----------|
-| one cell per session | O_EXCL atomic lock (fire + run both lock) |
-| orphan recovery | bg PID in lock, poll checks /proc |
+| one cell per session | O_EXCL lock, acquired before send |
+| timeout keeps lock | lock marked `timed_out`; only `k int` / `k kill` releases |
+| orphan recovery | bg PID in lock, poll checks `os.kill(pid, 0)` (POSIX) |
 | no line-wrap skew | tmux width 10000 |
-| atomic send | batch send-keys (single fork) |
-| ctrl-c safe | re-sends frame enters after SIGINT |
-| no output classification | status = "done" always |
+| atomic send | per-session named paste-buffer `k_{session}` |
+| ctrl-c safe | kills watcher, writes result, re-sends frame enters (repeat only) |
+| session name validation | `[A-Za-z0-9_.-]+`, no `..`, no path traversal |
+| idempotent pipe restart | pipe-pane replaced on every fire/run |
+| no output classification | "done" = prompt appeared, not success |
 
 ## Testing
 
@@ -81,9 +88,9 @@ bash test.sh           # 34 tests, covers all edge cases
 ## Files
 
 ```
-scripts/k      568 lines  main script
-scripts/km     219 lines  event monitor
-test.sh        204 lines  test suite (34 tests)
+scripts/k      main script
+scripts/km     event monitor
+test.sh        test suite (34 tests)
 SKILL.md                  agent reference
 EXAMPLES.md               patterns + philosophy
 ```

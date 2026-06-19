@@ -18,24 +18,25 @@ k new dbg "gdb -q ./app" --prompt="(gdb)"
 k run -j dbg "break main"
 ```
 
-Zero config for bash/python. `--prompt` for REPLs where empty Enter doesn't redisplay the prompt (gdb, node).
+Zero config for bash/python. `--prompt` for exact match or custom hook.
 
 ## Commands
 
 ```
-k new    <session> <cmd...> [--prompt="x"]  spawn session
-k fire   [session] <code> [-t N]            async fire (default timeout 300s)
-k poll   [session] [cell_id]                poll result (O(1))
-k run    [session] <code>                   sync (fire + poll inline)
-k run -j [session] <code>                   sync, JSON output
-k run -j -t N [session] <code>              sync, custom timeout
-k notify [session] <message>                notification (direct to log)
-k int    [session]                          ctrl-c + re-send frame
-k kill   <session>                          kill + cleanup
-k ls                                        list sessions
-k status [session]                          health check
-k watch  [session]                          live filtered view
-k history [session] [-n N]                  last N cells
+k new    <session> <cmd...> [--prompt="x"]     spawn session
+k new    <session> <cmd> --prompt=./hook        hook mode
+k fire   [session] <code> [-t N]               async fire (default timeout 300s)
+k poll   [session] [cell_id]                   poll result (O(1))
+k run    [session] <code>                      sync (lock + send + wait inline)
+k run -j [session] <code>                      sync, JSON output
+k run -j -t N [session] <code>                 sync, custom timeout
+k notify [session] <message>                   notification (direct to log)
+k int    [session]                             ctrl-c (+ re-frame in repeat mode)
+k kill   <session>                             kill + cleanup
+k ls                                           list sessions
+k status [session]                             health check
+k watch  [session]                             live filtered view
+k history [session] [-n N]                     last N cells
 ```
 
 Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
@@ -44,21 +45,29 @@ Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
 
 ```
 k new   -> spawn tmux (width 10000) -> start pipe-pane
-k fire  -> batch send-keys (code + frame enters) -> bg watcher starts
+k fire  -> acquire lock -> paste-buffer (code) + send-keys (frame enters) -> bg watcher
 k poll  -> check result file (O(1)) -> return output or "running"
-k run   -> send code + run stream processor inline (blocking)
+k run   -> acquire lock -> send code + run stream processor inline -> release
 ```
 
-**Frame delimiter**: after code, k sends FRAME_ENTERS (5) empty Enters. The REPL redraws its prompt 5 times. The stream processor detects 5 consecutive identical lines = completion. No prompt detection needed.
+**Frame detection** has three modes via `--prompt`:
+
+| --prompt= | mode | how it works |
+|-----------|------|-------------|
+| *(not set)* | repeat | 5 empty Enters → detect 5 identical lines |
+| `"string"` | exact | match prompt string exactly |
+| `./file` | hook | stdin lines → hook exit = frame end |
 
 **Stream processor**: state machine (ECHOING -> OUTPUT -> DONE). Tails the log in real-time. Classifies each line as it arrives. Writes result file when done.
 
 **Background watcher**: fire spawns a Python subprocess per cell. It runs the stream processor and writes the result. poll reads the result file. O(1).
 
-## Frame Delimiter
+## Frame Detection
+
+### Default: repeated prompt lines (zero config)
 
 ```
-agent sends: echo hello + 5 empty Enters
+k sends: "echo hello" via paste-buffer + 5 empty Enters via send-keys
 log shows:
   echo hello              <- echo (skipped by echo_count)
   hello                   <- output (collected)
@@ -68,11 +77,29 @@ log shows:
   root@vm:/#              <- prompt 4 (from Enter)
   root@vm:/#              <- prompt 5 (from Enter)
                            <- 5 identical = DONE
-
-stream processor: sees 5 consecutive identical lines -> removes them from output -> done
 ```
 
-Works after cd, venv activation, prompt theme change. The repeated lines are always identical to each other regardless of what the prompt looks like.
+Works after cd, venv activation, prompt theme change.
+
+### Exact match: `--prompt="(gdb)"`
+
+For REPLs where empty Enter has side effects (gdb repeats last command).
+
+### Hook: `--prompt=./detect.py`
+
+k feeds ANSI-stripped lines to hook's stdin. Hook exits when frame ends. k pops the last line (= the boundary). Hook path must contain `/`.
+
+```python
+#!/usr/bin/env python3
+import sys, re
+while True:
+    line = sys.stdin.readline()
+    if not line: break
+    if re.match(r'.*[#$]\s*$', line.strip()):
+        sys.exit(0)
+```
+
+In hook mode, k does NOT filter `...` continuation prompts — the hook user takes full control of output.
 
 ## Sync Mode
 
@@ -81,7 +108,7 @@ k run -j work "echo hello"
 # {"cell_id":"...","status":"done","output":"hello"}
 ```
 
-Status is always "done". k detects completion, not errors. Agent reads output and decides.
+k does not classify command output. If the REPL returned to its prompt, status is "done" regardless of whether the command succeeded or failed. Agent reads output and decides.
 
 ## Async Mode
 
@@ -98,45 +125,62 @@ k poll work
 
 poll is O(1): checks if the background watcher wrote a result file.
 
+## Timeout
+
+On timeout, the lock is NOT released — the REPL command may still be running. Subsequent polls return `status: "timeout"` with a hint to use `k int` or `k kill`. Only explicit recovery releases the lock.
+
+```
+k fire work "make build -j8"   # takes too long
+k poll work                    # → {"status": "timeout", ...}
+k poll work                    # → {"status": "timeout", "output": "use k int or k kill"}
+k int work                     # sends Ctrl-C, writes result, releases lock
+k poll work                    # → {"status": "error", "output": "interrupted"}
+```
+
 ## ctrl-c
 
-`k int` sends SIGINT then re-sends frame enters (SIGINT clears readline's typeahead buffer). The background watcher detects the new prompts and resolves the cell.
+`k int` sends SIGINT, kills any bg watcher, writes an `error`/`interrupted` result for the old cell, and releases the lock. In repeat mode (no `--prompt`), it also re-sends frame enters because SIGINT clears readline's typeahead buffer. In prompt/hook mode, no extra Enters are sent (they could have side effects).
 
 ## JSON Schema
 
 ```
-fired:    {"cell_id": "...", "status": "fired"}
-running:  {"cell_id": "...", "status": "running"}
-done:     {"cell_id": "...", "status": "done", "output": "..."}
-error:    {"status": "error", "output": "no session 'x'"}
-timeout:  {"cell_id": "...", "status": "timeout", "output": ""}
+fired:        {"cell_id": "...", "status": "fired"}
+running:      {"cell_id": "...", "status": "running"}
+done:         {"cell_id": "...", "status": "done", "output": "..."}
+timeout:      {"cell_id": "...", "status": "timeout", "output": ""}
+error:        {"status": "error", "output": "no session 'x'"}
+interrupted:  {"cell_id": "...", "status": "error", "output": "interrupted"}
 ```
 
 ## Safety Invariants
 
 - One cell per session (O_EXCL lock). Second fire/run refused.
-- Lock stores bg watcher PID. poll detects orphaned watchers (OOM/crash).
-- Batch send-keys: all code lines sent in one tmux call (atomic, no race).
+- Lock acquired BEFORE send — rejected fire/run never touches the REPL.
+- Timeout keeps lock — prevents new commands from mixing with a potentially still-running REPL command. Only `k int` or `k kill` releases.
+- Lock stores bg watcher PID. poll detects orphaned watchers (crash/OOM) via `os.kill(pid, 0)` (POSIX-portable).
+- Code sent via per-session named paste-buffer (no cross-session collision).
 - tmux width 10000: prevents line wrapping that would skew echo_count.
-- k does not classify output. Status always "done". Agent decides.
+- Session names validated: `[A-Za-z0-9_.-]+`, no path traversal.
+- Pipe-pane restarted on every fire/run (idempotent, recovers dead pipes).
+- k does not classify output. "done" = prompt appeared, not "command succeeded".
 
 ## Metadata on Disk
 
 ```
 /tmp/k_cells/<session>/
   _session.json       {name} or {name, prompt}
-  _lock.json          {cell_id, log_offset, echo_count, bg_pid}
+  _lock.json          {cell_id, log_offset, echo_count, bg_pid, timed_out?}
   _output.log         pipe-pane stream (append-only)
   <cell_id>_result.json  stream processor output (deleted after poll)
 ```
 
 ## Known Limitations
 
-**Frame collision**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare in practice.
+**Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
 
 **echo_count heuristic**: assumes 1 sent line = 1 echoed line. Mitigated by tmux width 10000 (no wrapping) and continuation prompt filtering.
 
-**--prompt mode**: for REPLs where empty Enter has side effects (gdb repeats last command, node prints undefined). Uses exact prompt matching instead of repeat detection.
+**Hook mode**: no `...` filtering (user takes full control). Hook path must contain `/` to distinguish from string prompts.
 
 ## Python Multi-line
 
@@ -158,9 +202,10 @@ k run -j py "print(factorial(10))"
 k is REPL-agnostic. Any program with a readline prompt works:
 
 ```bash
-k new work bash                                # zero config
-k new py python3 -i                            # zero config
-k new dbg "gdb -q ./app" --prompt="(gdb)"      # explicit prompt
+k new work bash                                # zero config (repeat mode)
+k new py python3 -i                            # zero config (repeat mode)
+k new dbg "gdb -q ./app" --prompt="(gdb)"      # exact match
+k new custom ./repl --prompt=./detect.py        # hook
 k new redis redis-cli                          # zero config
 k new remote "ssh prod"                        # zero config
 ```

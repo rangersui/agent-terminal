@@ -36,6 +36,12 @@ from datetime import datetime, timezone
 
 TMUX = shutil.which("tmux") or "tmux"
 
+_SAFE_NAME = re.compile(r'^[A-Za-z0-9_.-]+$')
+def _validate_name(s):
+    if not s or not _SAFE_NAME.match(s) or '..' in s:
+        print(f"km: invalid session name: {s!r}", file=sys.stderr)
+        sys.exit(1)
+
 ANSI_RE = re.compile(
     r"\x1b\[[0-9;]*[a-zA-Z]"
     r"|\x1b\[<[0-9;]*[mM]"
@@ -96,21 +102,17 @@ def session_log_path(session: str) -> str:
 
 def start_pipe(session: str) -> str:
     """
-    Use k's session log. Start pipe-pane only if log doesn't exist yet.
-    If k already started pipe-pane (via k new), this is a no-op.
+    (Re)start pipe-pane. Idempotent — replaces dead/existing pipe.
     """
     logfile = session_log_path(session)
 
     os.makedirs(os.path.join(CELL_DIR, session), exist_ok=True)
 
-    if not os.path.exists(logfile):
-        # k hasn't started pipe yet — start it ourselves
-        open(logfile, "w").close()
-        subprocess.run(
-            [TMUX, "pipe-pane", "-t", session, "-o", f"cat >> '{logfile}'"],
-            check=True,
-        )
-    # else: log exists → pipe is running → don't touch it
+    open(logfile, "a").close()
+    subprocess.run(
+        [TMUX, "pipe-pane", "-t", session, f"cat >> '{logfile}'"],
+        check=True,
+    )
 
     return logfile
 
@@ -200,6 +202,7 @@ def main():
         return 0
 
     session = args[0]
+    _validate_name(session)
     cell_id = None
     oneshot = False
 

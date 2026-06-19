@@ -4,6 +4,7 @@ k — structured async execution over PTY for AI agents
 
 Usage:
   k new    <session> <cmd...> [--prompt="x"]  spawn session
+  k new    <session> <cmd> --prompt=./hook     hook mode (custom frame detect)
   k fire   [session] <code> [-t N]            async fire (default 300s)
   k poll   [session] [cell_id]                poll result
   k run    [session] <code>                   sync
@@ -19,9 +20,13 @@ Usage:
   k history [session] [-n N]                  last N cells
 
 Session resolves: explicit arg → K_SESSION env → auto-detect.
-Any REPL works. Zero config. Frame delimiter = repeated prompt lines.
+
+Frame detection (--prompt):
+  not set      → 5 empty Enters, detect repeated prompt lines (zero config)
+  "string"     → exact prompt match (e.g. --prompt="(gdb)")
+  ./file       → stdin hook: k feeds lines, hook exit = frame end
 """
-import json, os, re, shutil, subprocess, sys, time, uuid
+import json, os, re, signal, shutil, subprocess, sys, time, uuid
 
 TMUX = shutil.which("tmux") or "tmux"
 CELL_DIR = "/tmp/k_cells"
@@ -66,7 +71,7 @@ class T:
     @staticmethod
     def pipe_start(s, logfile):
         open(logfile, "a").close()
-        subprocess.run([TMUX, "pipe-pane", "-t", s, "-o", f"cat >> '{logfile}'"], check=True)
+        subprocess.run([TMUX, "pipe-pane", "-t", s, f"cat >> '{logfile}'"], check=True)
     @staticmethod
     def pipe_stop(s):
         subprocess.run([TMUX, "pipe-pane", "-t", s], capture_output=True)
@@ -86,8 +91,8 @@ def _log_size(s):
     except FileNotFoundError: return 0
 
 def _ensure_pipe(s):
+    """(Re)start pipe-pane. Idempotent — replaces dead/existing pipe."""
     logpath = _log(s)
-    if os.path.exists(logpath): return
     os.makedirs(os.path.join(CELL_DIR, s), exist_ok=True)
     T.pipe_start(s, logpath)
 
@@ -97,15 +102,27 @@ def _log_event(s, event):
     except OSError: pass
 
 def _resolve(explicit=None):
-    if explicit: return explicit
+    if explicit:
+        _validate_name(explicit)
+        return explicit
     env = os.environ.get("K_SESSION")
-    if env: return env
+    if env:
+        _validate_name(env)
+        return env
     if os.path.isdir(CELL_DIR):
         ss = [d for d in os.listdir(CELL_DIR) if os.path.isfile(os.path.join(CELL_DIR, d, "_session.json"))]
-        if len(ss) == 1: return ss[0]
+        if len(ss) == 1:
+            _validate_name(ss[0])
+            return ss[0]
     return None
 
 def _json(d): print(json.dumps(d, ensure_ascii=False))
+
+_SAFE_NAME = re.compile(r'^[A-Za-z0-9_.-]+$')
+def _validate_name(s):
+    """Reject path traversal / injection in session names."""
+    if not s or not _SAFE_NAME.match(s) or '..' in s:
+        print(f"ERR invalid session name: {s!r}"); sys.exit(1)
 
 
 # ═══════════════════════════════════════════
@@ -170,76 +187,119 @@ def _release(session, cell_id):
 
 def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prompt=None):
     """
-    Stream processor with two modes:
-      prompt=None  → frame delimiter = N consecutive identical lines (default)
-      prompt="x"   → frame delimiter = exact prompt match (for gdb etc.)
+    Stream processor with three modes:
+      prompt=None      → frame = N consecutive identical lines (default)
+      prompt="string"  → frame = exact prompt match
+      prompt="./file"  → frame = hook process (stdin lines, exit=done)
     """
     logpath = _log(session)
-    state = "ECHOING"
+    state = "OUTPUT" if echo_count <= 0 else "ECHOING"
     remaining = echo_count
     output = []
     deadline = time.monotonic() + timeout if timeout else None
     repeat_count = 0
     last_clean = None
 
-    with open(logpath, "r", errors="replace") as f:
-        f.seek(log_offset)
-        while True:
-            if deadline and time.monotonic() > deadline:
-                return {"cell_id": cell_id, "status": "timeout", "output": ""}
+    # start hook process if prompt is an absolute file path (canonicalised by cmd_new)
+    hook = None
+    if prompt and os.path.isabs(prompt) and os.path.isfile(prompt):
+        hook = subprocess.Popen(
+            [prompt], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, text=True
+        )
+        prompt = None  # don't also do string matching
 
-            line = f.readline()
-            if not line:
-                time.sleep(0.05)
-                continue
+    last_appended = False  # tracks if last line was appended (not filtered)
+    timed_out = False
 
-            clean = ANSI_RE.sub("", line).strip()
-            if not clean:
-                continue
+    try:
+        with open(logpath, "r", errors="replace") as f:
+            f.seek(log_offset)
+            while True:
+                if deadline and time.monotonic() > deadline:
+                    timed_out = True
+                    break
 
-            if clean.startswith("── cell:") or clean.startswith("── notify "):
-                continue
-
-            if state == "ECHOING":
-                remaining -= 1
-                if remaining <= 0:
-                    state = "OUTPUT"
-
-            elif state == "OUTPUT":
-                if prompt:
-                    if clean == prompt:
-                        break
-                    if clean == "..." or clean.startswith("... "):
-                        continue
-                    output.append(clean)
-                else:
-                    if clean == "..." or clean.startswith("... "):
-                        last_clean = clean
-                        continue
-
-                    if clean == last_clean:
-                        repeat_count += 1
-                    else:
-                        repeat_count = 0
-
-                    output.append(clean)
-
-                    if repeat_count >= FRAME_ENTERS - 1:
-                        # frame delimiter — remove all prompt repeats from output
-                        for _ in range(repeat_count + 1):
+                line = f.readline()
+                if not line:
+                    if hook and hook.poll() is not None:
+                        # hook exited — pop last line only if it was appended
+                        if output and last_appended:
                             output.pop()
                         break
-                last_clean = clean
+                    time.sleep(0.05)
+                    continue
+
+                clean = ANSI_RE.sub("", line).strip()
+                if not clean:
+                    continue
+
+                if clean.startswith("── cell:") or clean.startswith("── notify "):
+                    continue
+
+                if state == "ECHOING":
+                    remaining -= 1
+                    if remaining <= 0:
+                        state = "OUTPUT"
+
+                elif state == "OUTPUT":
+                    if hook:
+                        # hook mode: feed line, exit = frame end
+                        # NO filtering — hook user takes full control of output
+                        try:
+                            hook.stdin.write(clean + "\n")
+                            hook.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            if output and last_appended:
+                                output.pop()
+                            break
+                        output.append(clean)
+                        last_appended = True
+                        time.sleep(0.01)
+                        if hook.poll() is not None:
+                            output.pop()
+                            break
+                    elif prompt:
+                        # string mode: exact match
+                        if clean == prompt:
+                            break
+                        if clean == "..." or clean.startswith("... "):
+                            continue
+                        output.append(clean)
+                    else:
+                        # repeat mode: N consecutive identical lines
+                        if clean == "..." or clean.startswith("... "):
+                            last_clean = clean
+                            continue
+
+                        if clean == last_clean:
+                            repeat_count += 1
+                        else:
+                            repeat_count = 0
+
+                        output.append(clean)
+
+                        if repeat_count >= FRAME_ENTERS - 1:
+                            for _ in range(repeat_count + 1):
+                                output.pop()
+                            break
+                    last_clean = clean
+    finally:
+        if hook:
+            if hook.poll() is None:
+                hook.kill()
+            hook.wait()
 
     result = {
         "cell_id": cell_id,
-        "status": "done",
-        "output": "\n".join(output)
+        "status": "timeout" if timed_out else "done",
+        "output": "" if timed_out else "\n".join(output)
     }
 
     with open(_result(session, cell_id), "w") as f:
         json.dump(result, f)
-    _log_event(session, f"── cell:{cell_id} done ──")
+    if not timed_out:
+        _log_event(session, f"── cell:{cell_id} done ──")
 
     return result
 
@@ -259,8 +319,9 @@ def _send_code(session, code, prompt=None):
 
     # paste-buffer: entire text arrives as one write → readline redraws once
     text = "\n".join(code_lines) + "\n"
-    subprocess.run([TMUX, "load-buffer", "-"], input=text.encode(), check=True)
-    subprocess.run([TMUX, "paste-buffer", "-d", "-t", session], check=True)
+    buf = f"k_{session}"
+    subprocess.run([TMUX, "load-buffer", "-b", buf, "-"], input=text.encode(), check=True)
+    subprocess.run([TMUX, "paste-buffer", "-b", buf, "-d", "-t", session], check=True)
 
     if not prompt:
         # frame enters still via send-keys (empty Enters, no echo issue)
@@ -275,9 +336,19 @@ def _send_code(session, code, prompt=None):
 # ═══════════════════════════════════════════
 
 def cmd_new(session, cmd_parts, prompt=None):
+    _validate_name(session)
     if T.has(session):
         print(f"OK {session} (alive)")
         return 0
+    # hook mode: path contains / or \ → canonicalize and fail early if missing
+    if prompt and (os.sep in prompt or "/" in prompt):
+        prompt = os.path.abspath(os.path.expanduser(prompt))
+        if not os.path.isfile(prompt):
+            print(f"ERR hook not found: {prompt}"); return 1
+        if not os.access(prompt, os.R_OK):
+            print(f"ERR hook not readable: {prompt}"); return 1
+        if not os.access(prompt, os.X_OK):
+            print(f"ERR hook not executable: {prompt}"); return 1
     cmd = " ".join(cmd_parts) if cmd_parts else "bash"
     _create(session, cmd, prompt)
     if prompt:
@@ -293,14 +364,20 @@ def cmd_fire(session, code, timeout=300):
 
     cell_id = uuid.uuid4().hex[:12]
     prompt = _session_prompt(session)
-    _ensure_pipe(session)
     echo_count = _echo_count(code)
 
-    # lock BEFORE sending — rejected fire must not touch the REPL
+    # lock BEFORE any side effects — rejected fire = zero touch
     log_offset = _log_size(session)
     held = _acquire(session, cell_id, log_offset, echo_count)
     if held:
         _json({"status": "error", "output": f"active cell '{held}'"}); return 1
+
+    # pipe restart only after we own the lock
+    try:
+        _ensure_pipe(session)
+    except Exception as e:
+        _release(session, cell_id)
+        _json({"status": "error", "output": f"pipe failed: {e}"}); return 1
 
     _send_code(session, code, prompt)
     _log_event(session, f"── cell:{cell_id} fired ──")
@@ -338,20 +415,41 @@ def cmd_poll(session, cell_id=None):
         try:
             with open(rpath) as f: result = json.load(f)
             os.unlink(rpath)
-            _release(session, cell_id)
+            if result.get("status") == "timeout":
+                # mark lock so subsequent polls don't orphan-release
+                try:
+                    with open(_lock(session), "r+") as f:
+                        lmeta = json.load(f)
+                        lmeta["timed_out"] = True
+                        f.seek(0); f.truncate()
+                        json.dump(lmeta, f)
+                except: pass
+            else:
+                _release(session, cell_id)
             _json(result)
             return 0
         except: pass
 
-    # check if bg process died (orphaned lock)
+    # check lock state
     meta = _load_cell(session)
-    if meta and "bg_pid" in meta:
+
+    # no lock, or lock is for a different cell → this cell_id is unknown
+    if not meta or meta.get("cell_id") != cell_id:
+        _json({"cell_id": cell_id, "status": "error", "output": "unknown cell"})
+        return 1
+
+    # timed_out: command may still be running — only k int / k kill can release
+    if meta.get("timed_out"):
+        _json({"cell_id": cell_id, "status": "timeout", "output": "use k int or k kill"})
+        return 1
+
+    # check if bg process died (orphaned lock)
+    if "bg_pid" in meta:
         pid = meta["bg_pid"]
-        alive = False
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                alive = b"_bg" in f.read()  # still running our watcher
-        except (FileNotFoundError, PermissionError):
+            os.kill(pid, 0)  # POSIX: check process exists (no signal sent)
+            alive = True
+        except OSError:
             alive = False
         if not alive:
             _release(session, cell_id)
@@ -369,11 +467,10 @@ def cmd_run(session, code, timeout=30, json_out=False):
         return 1
 
     prompt = _session_prompt(session)
-    _ensure_pipe(session)
     cell_id = uuid.uuid4().hex[:12]
     echo_count = _echo_count(code)
 
-    # lock BEFORE sending — rejected run must not touch the REPL
+    # lock BEFORE any side effects — rejected run = zero touch
     log_offset = _log_size(session)
     held = _acquire(session, cell_id, log_offset, echo_count)
     if held:
@@ -381,9 +478,20 @@ def cmd_run(session, code, timeout=30, json_out=False):
         else: print(f"ERR active cell '{held}'")
         return 1
 
+    # pipe restart only after we own the lock
+    try:
+        _ensure_pipe(session)
+    except Exception as e:
+        _release(session, cell_id)
+        if json_out: _json({"status": "error", "output": f"pipe failed: {e}"})
+        else: print(f"ERR pipe failed: {e}")
+        return 1
+
     _send_code(session, code, prompt)
     result = _stream_process(session, cell_id, log_offset, echo_count, timeout, prompt)
-    _release(session, cell_id)
+    if result.get("status") != "timeout":
+        _release(session, cell_id)
+    # timeout: lock kept — command may still be running, use k int / k kill
 
     if json_out: _json(result)
     else: print(result.get("output", ""))
@@ -403,14 +511,36 @@ def cmd_notify(session, message):
 def cmd_int(s):
     T.send_int(s)
     time.sleep(0.3)
-    # re-send frame enters (SIGINT clears readline's typeahead buffer)
-    args = [TMUX, "send-keys", "-t", s]
-    for _ in range(FRAME_ENTERS):
-        args.extend(["", "Enter"])
-    subprocess.run(args, check=True)
+    # re-send frame enters only in repeat mode
+    # (in prompt/hook mode, empty Enters could have side effects — gdb repeats)
+    prompt = _session_prompt(s)
+    if not prompt:
+        args = [TMUX, "send-keys", "-t", s]
+        for _ in range(FRAME_ENTERS):
+            args.extend(["", "Enter"])
+        subprocess.run(args, check=True)
+    # kill bg watcher (if any) before releasing lock
+    # prevents old watcher from consuming new cell's output
+    meta = _load_cell(s)
+    if meta:
+        cell_id = meta["cell_id"]
+        if "bg_pid" in meta:
+            try: os.kill(meta["bg_pid"], signal.SIGTERM)
+            except OSError: pass
+            time.sleep(0.2)  # let watcher exit
+        # write result so poll finds closure — overwrites timeout result too
+        rpath = _result(s, cell_id)
+        with open(rpath, "w") as f:
+            json.dump({"cell_id": cell_id, "status": "error", "output": "interrupted"}, f)
+        _release(s, cell_id)
     print("OK"); return 0
 
 def cmd_kill(s):
+    # kill bg watcher if running
+    meta = _load_cell(s)
+    if meta and "bg_pid" in meta:
+        try: os.kill(meta["bg_pid"], signal.SIGTERM)
+        except OSError: pass
     T.pipe_stop(s); T.kill(s)
     d = os.path.join(CELL_DIR, s)
     if os.path.isdir(d): shutil.rmtree(d, ignore_errors=True)
@@ -499,6 +629,7 @@ def main():
 
     if verb == "_bg" and len(rest) >= 5:
         session, cell_id, offset, echo, tout = rest[:5]
+        _validate_name(session)
         prompt = rest[5] if len(rest) > 5 else None
         _stream_process(session, cell_id, int(offset), int(echo), timeout=int(tout), prompt=prompt)
         return 0
@@ -509,7 +640,8 @@ def main():
             if a.startswith("--prompt="): prompt = a[len("--prompt="):]
             else: cmd_parts.append(a)
         return cmd_new(rest[0], cmd_parts, prompt)
-    if verb == "kill" and rest: return cmd_kill(rest[0])
+    if verb == "kill" and rest:
+        _validate_name(rest[0]); return cmd_kill(rest[0])
     if verb == "ls": return cmd_ls()
 
     if verb in ("run", "await"):
@@ -518,7 +650,7 @@ def main():
             if rest[0] == "-t" and len(rest) >= 2: timeout = int(rest[1]); rest = rest[2:]
             elif rest[0] == "-j": json_out = True; rest = rest[1:]
             else: break
-        if len(rest) >= 2: s, c = rest[0], rest[1]
+        if len(rest) >= 2: s, c = rest[0], rest[1]; _validate_name(s)
         elif len(rest) == 1: s, c = _resolve(), rest[0]
         else: print("usage: k run [-j] [-t N] [session] <code>"); return 1
         if not s: print("ERR: no session found."); return 1
@@ -529,7 +661,8 @@ def main():
         while rest and rest[0].startswith("-"):
             if rest[0] == "-t" and len(rest) >= 2: timeout = int(rest[1]); rest = rest[2:]
             else: break
-        s, c = (rest[0], rest[1]) if len(rest) >= 2 else (_resolve(), rest[0])
+        if len(rest) >= 2: s, c = rest[0], rest[1]; _validate_name(s)
+        else: s, c = _resolve(), rest[0]
         if not s: print("ERR: no session found."); return 1
         return cmd_fire(s, c, timeout)
 
@@ -539,7 +672,8 @@ def main():
         return cmd_poll(s, rest[1] if len(rest) >= 2 else None)
 
     if verb == "notify" and rest:
-        if len(rest) >= 2 and T.has(rest[0]): s, msg = rest[0], " ".join(rest[1:])
+        if len(rest) >= 2 and T.has(rest[0]):
+            _validate_name(rest[0]); s, msg = rest[0], " ".join(rest[1:])
         else: s, msg = _resolve(), " ".join(rest)
         if not s: print("ERR: no session found."); return 1
         return cmd_notify(s, msg)

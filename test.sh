@@ -22,7 +22,7 @@ out() { python3 -c "import sys,json;print(json.load(sys.stdin)['output'])" 2>/de
 cid() { python3 -c "import sys,json;print(json.load(sys.stdin)['cell_id'])" 2>/dev/null; }
 
 cleanup() { for s in "$@"; do $K kill "$s" 2>/dev/null; done; }
-reset() { rm -rf /tmp/k_cells; tmux kill-server 2>/dev/null; }
+reset() { for s in w p d; do rm -rf /tmp/k_cells/$s; tmux kill-session -t $s 2>/dev/null; done; }
 
 # ═══════════════════════════════════════════
 echo "═══ k-kernel test suite ═══"
@@ -135,7 +135,7 @@ for i in 1 2 3 4 5; do
     echo "$R" | grep -q '"done"\|"error"' && break
     sleep 1
 done
-check "int-resolves" "done" "$R"
+check "int-resolves" "interrupted" "$R"
 check "int-recover"  "ok"       "$($K run -j w 'echo ok')"
 cleanup w
 
