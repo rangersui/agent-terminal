@@ -624,10 +624,13 @@ def _pane_last_visible(session: str) -> str | None:
     live pane content via ``capture-pane`` — used by both exact-match and
     hook modes as a fallback when the log goes silent.
     """
-    r = subprocess.run(
-        [TMUX, "capture-pane", "-t", session, "-p"],
-        capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            [TMUX, "capture-pane", "-t", session, "-p"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     if r.returncode != 0:
         return None
     for line in reversed(r.stdout.split("\n")):
@@ -1140,6 +1143,8 @@ def cmd_run(session: str, code: str, timeout: int = 30, json_out: bool = False) 
         return 1
 
     _emit(json_out, result)
+    # timeout returns 0: the command may still be running and the lock is held.
+    # This is not a k error — use k int or k kill to resolve.
     return 1 if result.get("status") == ERROR else 0
 
 

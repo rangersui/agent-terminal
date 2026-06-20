@@ -126,7 +126,11 @@ def monitor(session: str, cell_id: str | None = None, oneshot: bool = False) -> 
         E.error(session, f"no session '{session}'; use k new {session} bash")
         return 1
 
-    logfile = start_pipe(session)
+    try:
+        logfile = start_pipe(session)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        E.error(session, f"pipe setup failed: {exc}")
+        return 1
     tail_proc: subprocess.Popen[str] | None = None
 
     def cleanup(*_: object) -> None:
@@ -171,8 +175,9 @@ def monitor(session: str, cell_id: str | None = None, oneshot: bool = False) -> 
                     cid, status = last_completion
                     E.completed(cid, session, status)
                     return 0
-            except OSError:
-                scan_offset = 0
+            except OSError as exc:
+                E.error(session, f"pre-scan failed: {exc}")
+                return 1
 
         # tail -f: interrupt-driven (inotify on linux, kqueue on mac)
         # If pre-scanned, start from scan position to cover the race window;
