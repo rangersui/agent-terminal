@@ -36,6 +36,13 @@ k new py "env PYTHON_BASIC_REPL=1 python3 -i"  # Python 3.13+ (line-protocol mod
 k run -j py "print(42)"
 ```
 
+State persists across cells — `export`, `cd`, `def`, variable assignments all
+survive between `k run` calls. That is the point: the session is a live process,
+not a fresh shell per call.
+
+Before install, `./scripts/k` is the same CLI entry point — no pip needed.
+After install, `k` with no arguments prints the full help.
+
 ## Recommended Workflow
 
 The agent defaults to `k` — it is the shared working terminal, and you
@@ -123,6 +130,16 @@ Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
 ```bash
 OK work pipe=ok state=running cell=a1b2c3d4e5f6 next='k poll work a1b2c3d4e5f6 or k int work'
 ```
+
+`k history` shows the last few results without switching to the terminal:
+
+```bash
+k history work          # last 25 lines (5 cells × 5 lines)
+k history -n 2 work     # last 10 lines (2 cells × 5 lines)
+```
+
+Useful as a quick glance — the terminal is the full picture, but sometimes you
+just want to see the last couple of outputs inline.
 
 ## Frame Detection
 
@@ -265,6 +282,10 @@ km <session> [cell_id] [-1]
 ```
 
 `-1` exits after first completion — one-shot `.then()` for agent orchestration.
+With a cell_id, it waits for that specific cell. Without one, it pre-scans the
+log and returns the most recent completion — useful as a "did anything finish?"
+query, but be aware it may return an older cell (e.g. one that was interrupted)
+if nothing new has completed.
 
 ### Why km after k
 

@@ -130,7 +130,7 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
     <button class="copy-btn" aria-live="polite" onclick="navigator.clipboard.writeText('pip install agent-tty').then(()=>{this.textContent='copied!';setTimeout(()=>this.textContent='copy',1500)})" title="Copy">copy</button>
   </div>
   <p class="requires">Requires POSIX, Python 3.10+, and tmux 3.0+. Linux, macOS, and WSL are supported; native Windows fails fast.</p>
-  <p class="requires" style="margin-top:4px">v0.1.2 &middot; MIT</p>
+  <p class="requires" style="margin-top:4px">v0.1.3 &middot; MIT</p>
 </section>
 
 <!-- terminal demo -->
@@ -249,8 +249,8 @@ $ export FIX_READY=1
     </div>
     <div class="feature">
       <div class="icon">&#x1F3AF;</div>
-      <h3>Any REPL</h3>
-      <p>bash, python, gdb, redis-cli, ssh &mdash; anything with a readline prompt. Three frame detection modes adapt to each.</p>
+      <h3>Line-oriented REPLs</h3>
+      <p>bash, python3 -i, sqlite3, gdb, redis-cli, ssh &mdash; anything with a stable line prompt. Three frame detection modes adapt to each.</p>
     </div>
     <div class="feature">
       <div class="icon">&#x1F6E1;&#xFE0F;</div>

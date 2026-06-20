@@ -16,6 +16,7 @@ Usage:
   k status [session]                          health + next action
   k watch  [session]                          live filtered view
   k history [-n N] [session]                  last N*5 lines (default 5)
+                                             filtered narrative: cell markers, ✓/✗, 📢
   k --version                                 print agent-tty version
                                              aliases: k -V, k version
 

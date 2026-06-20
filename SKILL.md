@@ -24,7 +24,8 @@ k run -j work "echo hello"
 # {"cell_id":"...","status":"done","output":"hello"}
 
 k new py python3 -i
-k run -j py "print(42)"
+k run -j py "x = 42"
+k run -j py "print(x)"              # state persists: x is still alive
 
 k new dbg "gdb -q ./app" --prompt="(gdb)"
 k run -j dbg "break main"
@@ -55,6 +56,8 @@ k --version                                    print agent-tty version
 Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
 
 Use `k status <session>` when stuck. It repairs the log pipe if needed and prints the next useful command.
+
+`k history` shows the last few results inline — quick glance without switching to the terminal.
 
 **Frame detection** has three modes via `--prompt`:
 
@@ -248,7 +251,9 @@ Each stdout line is a JSON event. Any host with background-notification support 
 km <session> [cell_id] [-1]
 ```
 
-`-1` exits after first completion (one-shot `.then()`).
+`-1` exits after first completion (one-shot `.then()`). With a cell_id, waits for
+that specific cell. Without one, pre-scans the log and returns the most recent
+completion — be aware it may return an older cell if nothing new has completed.
 
 ### Persistent state plus monitor
 
