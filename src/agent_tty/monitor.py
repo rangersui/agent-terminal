@@ -45,6 +45,10 @@ if len(sys.argv) >= 2 and sys.argv[1] in _VERSION_ARGS:
     print(f"agent-tty {__version__}")
     sys.exit(0)
 
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    print(__doc__.strip())
+    sys.exit(0)
+
 from agent_tty._shared import (
     TMUX, TAIL, ANSI_RE, CELL_DIR,
     FIRED, DONE, CLOSED, ERROR, NOTIFY,

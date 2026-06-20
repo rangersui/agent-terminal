@@ -129,8 +129,8 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
     <code id="install-cmd">pip install agent-tty</code>
     <button class="copy-btn" aria-live="polite" onclick="navigator.clipboard.writeText('pip install agent-tty').then(()=>{this.textContent='copied!';setTimeout(()=>this.textContent='copy',1500)})" title="Copy">copy</button>
   </div>
-  <p class="requires">Refresh stale entrypoints with <code>python -m pip install --upgrade --force-reinstall agent-tty</code>, then check <code>k --version</code>, <code>km --version</code>, <code>agent-tty --version</code>, and <code>python -m agent_tty --version</code>.</p>
   <p class="requires">Requires POSIX, Python 3.10+, and tmux 3.0+. Linux, macOS, and WSL are supported; native Windows fails fast.</p>
+  <p class="requires" style="margin-top:4px">v0.1.1 &middot; MIT</p>
 </section>
 
 <!-- terminal demo -->
@@ -281,8 +281,7 @@ $ export FIX_READY=1
   <h2>km &mdash; callback monitor</h2>
   <p style="color:var(--dim);text-align:center;margin-bottom:24px;font-size:0.95rem">
     Persistent TTY state first; callback completion second.<br>
-    Each stdout line is one JSON event for agent orchestration.<br>
-    Designed for <strong>Claude Code's Monitor tool</strong>. Other frameworks: spawn <code>km</code> as a subprocess, read stdout.
+    Each stdout line is a JSON event. Any host with background-notification support can consume them directly.
   </p>
   <div class="terminal">
     <div class="terminal-bar">
