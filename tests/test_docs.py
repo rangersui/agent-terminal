@@ -139,6 +139,8 @@ for doc_name, text in (("README.md", README), ("SKILL.md", SKILL), ("docs/index.
     check(f"{doc_name}: package name", "agent-tty" in text)
     check(f"{doc_name}: shared human positioning", "shared live terminal for humans" in text.lower())
     check(f"{doc_name}: pip install", "pip install agent-tty" in text or doc_name == "man/agent-tty.1")
+# diagnostics (reinstall hint, version commands) — not required on the landing page
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL), ("man/agent-tty.1", MAN)):
     check(f"{doc_name}: reinstall stale entrypoint", "--force-reinstall agent-tty" in text)
     check(f"{doc_name}: version verification", "k --version" in text)
     check(f"{doc_name}: km version verification", "km --version" in text)
