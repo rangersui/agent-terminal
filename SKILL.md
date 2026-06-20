@@ -159,13 +159,14 @@ WSL is fine; native Windows fails fast.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
-**Line-protocol vs screen-redraw REPLs**: line-protocol REPLs (bash,
-python3 -i classic, sqlite3, node) emit clean newline-delimited output —
-framing works reliably. Screen-redraw REPLs (IPython, Python 3.13+ `_pyrepl`)
-emit raw terminal control sequences instead of text: cursor hides, color codes,
-double prompt redraws. After ANSI strip a single prompt becomes
-`In [4]: In [4]:` — broken framing. `PYTHON_BASIC_REPL=1` switches Python 3.13+
-back to line-protocol mode — always use it for agent work surfaces.
+**Line-protocol REPLs only — not TUIs**: agent-tty works with line-protocol
+REPLs (bash, python3 -i classic, sqlite3, node) that emit mostly clean text with
+stable prompts. TUIs — programs that paint the screen with cursor positioning and
+redraws, including IPython and Python 3.13+'s `_pyrepl` — are designed for human
+eyes, not programmatic consumption. Their terminal stream is VT100 draw
+instructions, not text; framing breaks. This is an impedance mismatch, not a bug.
+`PYTHON_BASIC_REPL=1` switches Python 3.13+ back to line-protocol mode — always
+use it for agent work surfaces.
 
 ## Python Multi-line
 
