@@ -256,9 +256,10 @@ python vendor/codex_bridge.py --session work --thread-id THREAD_ID
 
 The bridge is deliberately type-sealed: km lines must parse into `KmEvent`,
 thread ids must become `ThreadHandle`, thread runtime must become
-`ThreadRuntimeStatus`, and visible `turn/start` calls only accept an
-`EventPrompt` derived from a validated event and optional `PollResult`. The
-static check is `python tests/test_bridge_contracts.py`.
+`ThreadRuntimeStatus`, idle delivery must become `IdleThread`, and visible
+`turn/start` calls only accept an `IdleThread` plus an `EventPrompt` derived
+from a validated event and optional `PollResult`. The static check is
+`python tests/test_bridge_contracts.py`.
 
 ### Events
 

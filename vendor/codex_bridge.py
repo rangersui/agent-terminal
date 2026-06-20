@@ -18,13 +18,15 @@ Type-seal shape:
     InitializedCodex    proof that initialize + initialized completed
     ThreadHandle        proof that app-server accepted/resumed/started a thread
     ThreadRuntimeStatus validated active/idle status for visible delivery
+    IdleThread          proof that app-server reported the thread idle
     StartedTurn         proof that app-server accepted a visible turn
     KmEvent             validated km JSON line
     PollResult          validated best-effort k poll result for a completed cell
     EventPrompt         visible turn text derived from a KmEvent
 
 Protected operations require proof objects. `turn/start` does not accept a raw
-thread id or arbitrary bridge text, and km lines are not forwarded until they
+thread id, a merely resumed thread, or arbitrary bridge text: it requires an
+`IdleThread` proof and an `EventPrompt`. km lines are not forwarded until they
 become KmEvent objects.
 
 Notes:
@@ -70,6 +72,30 @@ CELL_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 class BridgeError(RuntimeError):
+    pass
+
+
+class BridgeTransportError(BridgeError):
+    pass
+
+
+class BridgeRpcError(BridgeError):
+    pass
+
+
+class BridgeProtocolError(BridgeError):
+    pass
+
+
+class BridgeThreadError(BridgeError):
+    pass
+
+
+class BridgeThreadStateError(BridgeThreadError):
+    pass
+
+
+class BridgeTurnError(BridgeError):
     pass
 
 
@@ -131,6 +157,36 @@ class ThreadRuntimeStatus:
     @property
     def is_idle(self) -> bool:
         return self.kind == "idle"
+
+    def require_idle(self, thread: ThreadHandle) -> "IdleThread":
+        return IdleThread(thread, self, _IDLE_THREAD_TOKEN)
+
+
+_IDLE_THREAD_TOKEN = object()
+
+
+class IdleThread:
+    """Proof that app-server reported this thread idle for visible delivery."""
+
+    def __init__(self, thread: ThreadHandle, status: ThreadRuntimeStatus, token: object) -> None:
+        if token is not _IDLE_THREAD_TOKEN:
+            raise BridgeThreadStateError("IdleThread must be created from ThreadRuntimeStatus.require_idle")
+        if not status.is_idle:
+            raise BridgeThreadStateError(f"thread {thread.id} is not idle: {status.kind}")
+        self._thread = thread
+        self._status = status
+
+    @property
+    def id(self) -> str:
+        return self._thread.id
+
+    @property
+    def thread(self) -> ThreadHandle:
+        return self._thread
+
+    @property
+    def status(self) -> ThreadRuntimeStatus:
+        return self._status
 
 
 @dataclass(frozen=True)
@@ -263,16 +319,19 @@ class _CodexRpc:
     """Raw JSON-RPC transport. Keep app-server protocol methods out of callers."""
 
     def __init__(self, codex_bin: str) -> None:
-        self._proc = subprocess.Popen(
-            [codex_bin, "app-server"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            text=True,
-            bufsize=1,
-        )
+        try:
+            self._proc = subprocess.Popen(
+                [codex_bin, "app-server"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise BridgeTransportError(f"failed to start codex app-server: {exc}") from exc
         if self._proc.stdin is None or self._proc.stdout is None:
-            raise BridgeError("failed to open codex app-server pipes")
+            raise BridgeTransportError("failed to open codex app-server pipes")
         self._stdin = self._proc.stdin
         self._stdout = self._proc.stdout
         self._next_id = 1
@@ -297,17 +356,21 @@ class _CodexRpc:
         self._next_id += 1
         response_queue: "queue.Queue[JsonMap]" = queue.Queue(maxsize=1)
         self._pending[request_id] = PendingRequest(method, response_queue)
-        self._send({"method": method, "id": request_id, "params": params or {}})
+        try:
+            self._send({"method": method, "id": request_id, "params": params or {}})
+        except OSError as exc:
+            self._pending.pop(request_id, None)
+            raise BridgeTransportError(f"failed to send {method}: {exc}") from exc
         try:
             msg = response_queue.get(timeout=timeout)
         except queue.Empty as exc:
             self._pending.pop(request_id, None)
-            raise BridgeError(f"timeout waiting for {method}") from exc
+            raise BridgeRpcError(f"timeout waiting for {method}") from exc
         if "error" in msg:
-            raise BridgeError(f"{method} failed: {msg['error']}")
+            raise BridgeRpcError(f"{method} failed: {msg['error']}")
         result = msg.get("result", {})
         if not isinstance(result, dict):
-            raise BridgeError(f"{method} returned non-object result: {result!r}")
+            raise BridgeProtocolError(f"{method} returned non-object result: {result!r}")
         return result
 
     def _send(self, msg: JsonMap) -> None:
@@ -332,6 +395,13 @@ class _CodexRpc:
                     self.notifications.put(msg)
             else:
                 self.notifications.put(msg)
+        self._fail_pending("codex app-server stdout closed")
+
+    def _fail_pending(self, reason: str) -> None:
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for request in pending:
+            request.response.put({"error": reason})
 
 
 class InitializedCodex:
@@ -391,24 +461,30 @@ class InitializedCodex:
 
     def resume_thread(self, thread_id: str) -> ThreadHandle:
         _validate_wire_id(thread_id, "thread id")
-        result = self._rpc.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
-        thread = result.get("thread")
-        if isinstance(thread, dict) and isinstance(thread.get("id"), str):
-            return ThreadHandle(str(thread["id"]))
-        return ThreadHandle(thread_id)
+        try:
+            result = self._rpc.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+        except (BridgeRpcError, BridgeProtocolError) as exc:
+            raise BridgeThreadError(str(exc)) from exc
+        return _thread_from_result("thread/resume", result)
 
     def start_thread(self, model: str | None) -> ThreadHandle:
         params: JsonMap = {}
         if model:
             params["model"] = model
-        result = self._rpc.request("thread/start", params)
+        try:
+            result = self._rpc.request("thread/start", params)
+        except (BridgeRpcError, BridgeProtocolError) as exc:
+            raise BridgeThreadError(str(exc)) from exc
         return _thread_from_result("thread/start", result)
 
     def read_thread_status(self, thread: ThreadHandle) -> ThreadRuntimeStatus:
-        result = self._rpc.request("thread/read", {"threadId": thread.id, "includeTurns": False})
+        try:
+            result = self._rpc.request("thread/read", {"threadId": thread.id, "includeTurns": False})
+        except (BridgeRpcError, BridgeProtocolError) as exc:
+            raise BridgeThreadError(str(exc)) from exc
         thread_obj = result.get("thread")
         if not isinstance(thread_obj, dict):
-            raise BridgeError(f"thread/read returned unexpected result: {result}")
+            raise BridgeThreadError(f"thread/read returned unexpected result: {result}")
         return ThreadRuntimeStatus.parse(thread_obj.get("status"))
 
     def drain_thread_status(self, thread: ThreadHandle, current: ThreadRuntimeStatus) -> ThreadRuntimeStatus:
@@ -422,24 +498,27 @@ class InitializedCodex:
             if updated is not None:
                 status = updated
 
-    def start_visible_turn(self, thread: ThreadHandle, prompt: EventPrompt) -> StartedTurn:
-        result = self._rpc.request(
-            "turn/start",
-            {
-                "threadId": thread.id,
-                "input": prompt.to_turn_input(),
-            },
-        )
+    def start_visible_turn(self, thread: IdleThread, prompt: EventPrompt) -> StartedTurn:
+        try:
+            result = self._rpc.request(
+                "turn/start",
+                {
+                    "threadId": thread.id,
+                    "input": prompt.to_turn_input(),
+                },
+            )
+        except (BridgeRpcError, BridgeProtocolError) as exc:
+            raise BridgeTurnError(str(exc)) from exc
         turn = result.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
-            raise BridgeError(f"turn/start returned unexpected result: {result}")
+            raise BridgeTurnError(f"turn/start returned unexpected result: {result}")
         return StartedTurn(str(turn["id"]))
 
 
 def _thread_from_result(method: str, result: JsonMap) -> ThreadHandle:
     thread = result.get("thread")
     if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
-        raise BridgeError(f"{method} returned unexpected result: {result}")
+        raise BridgeThreadError(f"{method} returned unexpected result: {result}")
     return ThreadHandle(str(thread["id"]))
 
 
@@ -592,13 +671,14 @@ def run_bridge(args: argparse.Namespace) -> int:
                 last_status_check = now
 
             if pending and status.is_idle:
+                idle_thread = status.require_idle(thread)
                 prompt = EventPrompt.batch(pending)
-                turn = codex.start_visible_turn(thread, prompt)
+                turn = codex.start_visible_turn(idle_thread, prompt)
                 print(f"[bridge] started visible turn={turn.id} events={len(pending)}", file=sys.stderr)
                 pending.clear()
-                status = ThreadRuntimeStatus(kind="active")
                 if args.once:
                     return 0
+                status = codex.read_thread_status(thread)
 
             if km_closed and not pending:
                 return km_proc.wait()
