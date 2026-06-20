@@ -131,13 +131,14 @@ k run -j py "exec(open('/tmp/my_ctx.py').read())"
 Save current state, restore later:
 
 ```bash
-k run -j py "
+cat > /tmp/k_save_state.py << 'EOF'
 with open('/tmp/checkpoint.py', 'w') as f:
     f.write(f'radius = {repr(radius)}\n')
     f.write(f'data = {repr(data)}\n')
     f.write(f'results = {repr(results)}\n')
 print('checkpointed')
-"
+EOF
+k run -j py "exec(open('/tmp/k_save_state.py').read())"
 
 # later, in a new session
 k run -j py "exec(open('/tmp/checkpoint.py').read())"
@@ -580,6 +581,195 @@ r = subprocess.run(['k', 'poll', 'work'], capture_output=True, text=True)
 print(json.loads(r.stdout)['status'])
 "
 ```
+
+---
+
+## Pattern: Worker Isolation
+
+Some live connections cannot survive `k int`. Playwright's sync API runs on
+asyncio/greenlets bound to the main thread — a KeyboardInterrupt corrupts the
+event loop, and `launch()` cannot be called again in the same process. Database
+pools, GPU runtimes, and other libraries that own an event loop have the same
+risk.
+
+The fix: separate durable state from fragile connections. Two k sessions, one
+Unix socket.
+
+### Architecture
+
+```
+ctrl  (durable)    — holds findings, plan, accumulated data
+                     never imports the fragile library
+                     sends code strings via Unix socket
+
+worker (disposable) — holds browser/db/GPU connection
+                      runs a socket server on the main thread
+                      exec's received code in its own namespace
+                      can be killed and restarted without data loss
+```
+
+### Worker: single-threaded socket server
+
+```bash
+cat > /tmp/k_worker_server.py << 'PYEOF'
+import socket, os, json, io, sys
+
+# private socket — not world-writable /tmp
+_run = os.environ.get('XDG_RUNTIME_DIR')
+if not _run:
+    _run = f'/tmp/k-worker-{os.getuid()}'
+    os.makedirs(_run, mode=0o700, exist_ok=True)
+SOCK = os.path.join(_run, 'k-worker.sock')
+ns = {}  # worker namespace — browser, page, etc. live here
+
+try:
+    os.unlink(SOCK)
+except FileNotFoundError:
+    pass
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(SOCK)
+srv.listen(1)
+print(f'worker listening on {SOCK}', flush=True)
+
+while True:
+    conn, _ = srv.accept()
+    data = b''
+    while True:
+        chunk = conn.recv(8192)
+        if not chunk:
+            break
+        data += chunk
+    code = data.decode()
+
+    out = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = out
+    try:
+        exec(code, ns)
+        status = 'ok'
+    except Exception as e:
+        print(f'ERROR: {e}')
+        status = 'error'
+    finally:
+        sys.stdout = old_stdout
+
+    result = json.dumps({'status': status, 'output': out.getvalue().rstrip()})
+    conn.sendall(result.encode())
+    conn.close()
+PYEOF
+```
+
+Critical: the server handles requests **serially on the main thread**. A
+threaded server fails with Playwright — `cannot switch to a different thread`.
+This applies to any library that assumes single-threaded event loop ownership.
+
+### Control plane: remote() helper
+
+```bash
+cat > /tmp/k_ctrl_client.py << 'PYEOF'
+import socket, json, os
+
+# must match server's socket path
+_run = os.environ.get('XDG_RUNTIME_DIR')
+if not _run:
+    _run = f'/tmp/k-worker-{os.getuid()}'
+SOCK = os.path.join(_run, 'k-worker.sock')
+
+def remote(code):
+    """Send code to worker, return output."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCK)
+    s.sendall(code.encode())
+    s.shutdown(socket.SHUT_WR)
+    data = b''
+    while True:
+        chunk = s.recv(8192)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    result = json.loads(data.decode())
+    if result['output']:
+        print(result['output'])
+    return result
+PYEOF
+```
+
+### Setup
+
+```bash
+# start worker session, fire the server (it blocks forever)
+k new worker python3 -i
+k fire worker "exec(open('/tmp/k_worker_server.py').read())"
+
+# start ctrl session, load the client
+k new ctrl python3 -i
+k run -j ctrl "exec(open('/tmp/k_ctrl_client.py').read())"
+```
+
+### Usage: browser in worker, data in ctrl
+
+Variables assigned inside `exec(code, ns)` go directly into `ns`. No need for
+`ns["browser"]` — just use bare names. Each `remote()` call shares the same
+namespace, so `browser` and `page` persist across calls.
+
+```bash
+# launch browser REMOTELY — it runs in the worker process
+cat > /tmp/k_task_launch_browser.py << 'EOF'
+remote('from cloakbrowser import launch; browser = launch(); page = browser.contexts[0].pages[0]; print("browser up")')
+EOF
+k run -j ctrl "exec(open('/tmp/k_task_launch_browser.py').read())"
+
+# browse — page lives in worker, findings accumulate in ctrl
+cat > /tmp/k_task_browse_hn.py << 'EOF'
+findings = []
+r = remote('page.goto("https://news.ycombinator.com"); print(page.title())')
+findings.append(r['output'])
+print(f'{len(findings)} findings so far')
+EOF
+k run -j ctrl "exec(open('/tmp/k_task_browse_hn.py').read())"
+
+# browse more
+cat > /tmp/k_task_browse_more.py << 'EOF'
+r = remote('page.goto("https://example.com"); print(page.query_selector("h1").inner_text())')
+findings.append(r['output'])
+print(f'{len(findings)} findings so far')
+EOF
+k run -j ctrl "exec(open('/tmp/k_task_browse_more.py').read())"
+```
+
+### The point: kill worker, data survives
+
+```bash
+# worker's browser dies or gets corrupted
+k kill worker
+
+# ctrl is untouched
+k run -j ctrl "print(f'findings intact: {len(findings)}')"
+# → findings intact: 2
+
+# relaunch worker, continue where you left off
+k new worker python3 -i
+k fire worker "exec(open('/tmp/k_worker_server.py').read())"
+cat > /tmp/k_task_relaunch_browser.py << 'EOF'
+remote('from cloakbrowser import launch; browser = launch(); page = browser.contexts[0].pages[0]; print("browser back")')
+EOF
+k run -j ctrl "exec(open('/tmp/k_task_relaunch_browser.py').read())"
+
+# keep going — findings still there, new browser ready
+cat > /tmp/k_task_browse_next.py << 'EOF'
+r = remote('page.goto("https://example.org"); print(page.title())')
+findings.append(r['output'])
+print(f'{len(findings)} findings now')
+EOF
+k run -j ctrl "exec(open('/tmp/k_task_browse_next.py').read())"
+# → 3 findings now
+```
+
+Worker died, restarted, browser relaunched. `findings` never left ctrl's
+memory. This is the pattern: **durable state in ctrl, fragile handles in
+worker, worker is disposable.**
 
 ---
 
