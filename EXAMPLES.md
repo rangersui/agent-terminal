@@ -19,6 +19,232 @@ The launcher is stateless. The target is stateful. This is exactly how curl talk
 
 ---
 
+## Pattern: Live Control Plane
+
+Static config + reload → live variables + one-cell patch.
+
+Feature flags, firewall rules, rate limits, circuit breaker thresholds —
+traditionally locked in config files. Change means edit, commit, deploy,
+restart, hope. In a persistent REPL, they are Python variables. The agent
+observes traffic, changes a variable, and the next request sees it. No restart.
+No redeploy. Connection never drops.
+
+### Example: adaptive firewall via nginx auth\_request
+
+nginx `auth_request` calls a subrequest before every protected request.
+Point it at a Flask handler running in your REPL:
+
+```nginx
+# nginx.conf
+location /api/ {
+    auth_request /ai-decide;
+    proxy_pass http://backend;
+}
+location = /ai-decide {
+    internal;
+    proxy_pass http://127.0.0.1:8080/decide;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Original-URI $request_uri;
+    proxy_set_header X-User-Agent $http_user_agent;
+}
+```
+
+The REPL is the decision engine:
+
+```bash
+cat > /tmp/k_firewall.py << 'EOF'
+import threading
+from flask import Flask, request
+
+app = Flask(__name__)
+blocked = set()
+fingerprints = {}
+rules = []
+
+@app.route('/decide')
+def decide():
+    ip = request.headers.get('X-Real-IP', request.remote_addr)
+    path = request.headers.get('X-Original-URI', '/')
+    ua = request.headers.get('X-User-Agent', '')
+
+    if ip in blocked:
+        return '', 403
+
+    fp = fingerprints.setdefault(ip, {'paths': [], 'ua': set()})
+    fp['paths'].append(path)
+    fp['ua'].add(ua)
+
+    for rule in rules:
+        verdict = rule(ip, path, ua, fp)
+        if verdict is not None:
+            return '', verdict
+
+    return '', 200
+
+threading.Thread(
+    target=lambda: app.run(host='127.0.0.1', port=8080, use_reloader=False),
+    daemon=True,
+).start()
+print('firewall listening on :8080')
+EOF
+
+k new firewall python3 -i
+k run -j firewall "exec(open('/tmp/k_firewall.py').read())"
+```
+
+Flask runs in a daemon thread; the REPL stays interactive. `blocked`,
+`fingerprints`, `rules` live in the same namespace — the agent reads and
+writes them, the handler sees changes on the next request.
+
+```bash
+# who's hitting the server?
+cat > /tmp/k_check_traffic.py << 'EOF'
+for ip, fp in sorted(fingerprints.items(), key=lambda x: len(x[1]['paths']), reverse=True)[:10]:
+    print(f'{ip}: {len(fp["paths"])} reqs, {len(fp["ua"])} UAs, last: {fp["paths"][-1]}')
+EOF
+k run -j firewall "exec(open('/tmp/k_check_traffic.py').read())"
+
+# block a scanner — immediate, no reload
+k run -j firewall "blocked.add('1.2.3.4'); print('blocked')"
+
+# add a rule: block anyone probing admin paths 3+ times
+cat > /tmp/k_add_rule.py << 'EOF'
+def block_scanner(ip, path, ua, fp):
+    probes = ['/wp-admin', '/phpmyadmin', '/.env', '/.git']
+    if sum(1 for p in fp['paths'] if any(s in p for s in probes)) >= 3:
+        blocked.add(ip)
+        return 403
+rules.append(block_scanner)
+print(f'{len(rules)} rules active')
+EOF
+k run -j firewall "exec(open('/tmp/k_add_rule.py').read())"
+```
+
+One cell changed the firewall. nginx didn't restart. Connections didn't drop.
+
+### Example: feature flags
+
+No external service. A dict:
+
+```bash
+cat > /tmp/k_flags.py << 'EOF'
+import random
+
+flags = {
+    'new_checkout': {'enabled': True, 'rollout': 0.1},
+    'dark_mode':    {'enabled': False},
+}
+
+def is_enabled(flag, user_id=None):
+    f = flags.get(flag, {})
+    if not f.get('enabled'):
+        return False
+    rollout = f.get('rollout', 1.0)
+    if user_id:
+        return (hash(user_id) % 100) / 100 < rollout
+    return random.random() < rollout
+EOF
+
+k new ctrl python3 -i
+k run -j ctrl "exec(open('/tmp/k_flags.py').read())"
+```
+
+Your app handler calls `is_enabled('new_checkout', user_id)`. The agent
+adjusts in real time:
+
+```bash
+# bug found — kill it now
+k run -j ctrl "flags['new_checkout']['enabled'] = False; print('killed')"
+
+# fixed — slow rollout
+k run -j ctrl "flags['new_checkout'] = {'enabled': True, 'rollout': 0.01}; print('1%')"
+
+# looks good — ramp
+k run -j ctrl "flags['new_checkout']['rollout'] = 0.1; print('10%')"
+
+# ship it
+k run -j ctrl "flags['new_checkout']['rollout'] = 1.0; print('100%')"
+```
+
+Each line takes effect on the next request. No deploy. No propagation delay.
+LaunchDarkly is a SaaS. This is a dict.
+
+### Example: circuit breaker
+
+Hystrix is a framework. This is 20 lines:
+
+```bash
+cat > /tmp/k_circuits.py << 'EOF'
+import time
+
+circuits = {}
+
+def call_service(name, fn):
+    c = circuits.setdefault(name, {
+        'fails': 0, 'state': 'closed', 'threshold': 5, 'opened_at': 0,
+    })
+    if c['state'] == 'open':
+        if time.time() - c['opened_at'] > 30:
+            c['state'] = 'half-open'
+        else:
+            raise Exception(f'{name} circuit open')
+    try:
+        result = fn()
+        c['fails'] = 0
+        if c['state'] == 'half-open':
+            c['state'] = 'closed'
+        return result
+    except Exception:
+        c['fails'] += 1
+        if c['fails'] >= c['threshold']:
+            c['state'] = 'open'
+            c['opened_at'] = time.time()
+        raise
+EOF
+
+k run -j ctrl "exec(open('/tmp/k_circuits.py').read())"
+```
+
+Your app calls `call_service('payment', lambda: stripe.charge(...))`. The
+agent adjusts live:
+
+```bash
+# init circuit (call_service auto-creates on first use, or init explicitly)
+k run -j ctrl "circuits.setdefault('payment', {'fails': 0, 'state': 'closed', 'threshold': 5, 'opened_at': 0}); print('ready')"
+
+# payment service is flaky — tolerate more before tripping
+k run -j ctrl "circuits['payment']['threshold'] = 20; print('threshold raised')"
+
+# manual trip during maintenance
+k run -j ctrl "import time; circuits['payment'].update(state='open', opened_at=time.time()); print('tripped')"
+
+# maintenance done — force close
+k run -j ctrl "circuits['payment'].update(state='closed', fails=0); print('closed')"
+
+# check all circuits
+cat > /tmp/k_check_circuits.py << 'EOF'
+for name, c in circuits.items():
+    print(f"{name}: {c['state']} ({c['fails']}/{c['threshold']} fails)")
+EOF
+k run -j ctrl "exec(open('/tmp/k_check_circuits.py').read())"
+```
+
+### Safety boundary
+
+One cell changing production behavior is a feature and a liability. In
+production, the live control plane needs guardrails:
+
+- **Audit log**: every mutation logged with timestamp, cell\_id, and before/after
+- **Checkpoint/rollback**: snapshot state before changes, restore if wrong
+- **Auth**: private Unix socket (see Worker Isolation) or TLS + token
+- **Human approval**: agent proposes, human confirms before apply
+- **Blast radius**: start with non-critical paths; graduate to critical ones
+
+The persistent REPL makes dynamic decisions trivial. Making them *safe* is
+the real engineering work.
+
+---
+
 ## Context Loading: source & exec
 
 A REPL is blank memory. `source` (bash) and `exec` (python) inject a snapshot into it. After loading, every cell runs inside that context.

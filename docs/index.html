@@ -233,6 +233,11 @@ $ export FIX_READY=1
       <p>Variables, cwd, imports, live connections, SSH sessions, and debugger state stay alive across agent turns.</p>
     </div>
     <div class="feature">
+      <div class="icon">&#x26A1;</div>
+      <h3>Live control plane</h3>
+      <p>Feature flags, firewall rules, rate limits, circuit breakers &mdash; static config becomes a variable the agent hot-patches in one cell. Next request sees it. No restart.</p>
+    </div>
+    <div class="feature">
       <div class="icon">&#x1F9F5;</div>
       <h3>Zero escaping</h3>
       <p>Write code to a file, load with <code>source</code>/<code>exec</code>. The heredoc is literal, the REPL command is one line, and live session state persists. No quoting layers to fight.</p>

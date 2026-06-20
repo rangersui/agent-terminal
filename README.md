@@ -16,6 +16,11 @@ The package is `agent-tty`. The CLI command is `k`, intentionally short to minim
 
 `bash_tool` is curl. `k` is a socket.
 
+The terminal is the interface. The primitive is live process state:
+variables, connections, servers, sockets, and decisions that survive across
+turns. Static config becomes a live variable the agent changes in one cell —
+no restart, no redeploy. See EXAMPLES.md *Live Control Plane*.
+
 Give your agent `k` when it needs memory between turns: Python imports,
 database connections, browser/CDP sockets, remote shells, debuggers, running
 servers. You see everything through `k watch` — cell markers, completion
