@@ -3,6 +3,17 @@
 # Usage: bash tests/test.sh [path/to/k]
 
 K="${1:-scripts/k}"
+if [[ "$K" == */* ]]; then
+    K_ABS=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$K")
+else
+    K_ABS=$(command -v "$K")
+fi
+if [[ "$K" == */k ]]; then
+    KM="${K%/k}/km"
+else
+    KM="km"
+fi
+VERSION=$(python3 -c 'import pathlib,re; print(re.search(r"^version = \"([^\"]+)\"", pathlib.Path("pyproject.toml").read_text(), re.M).group(1))')
 PASS=0
 FAIL=0
 
@@ -41,7 +52,7 @@ out() { python3 -c "import sys,json;print(json.load(sys.stdin)['output'])" 2>/de
 cid() { python3 -c "import sys,json;print(json.load(sys.stdin)['cell_id'])" 2>/dev/null; }
 
 cleanup() { for s in "$@"; do $K kill "$s" 2>/dev/null; done; }
-reset() { for s in w p d; do rm -rf "$CELL_DIR/$s"; tmux kill-session -t $s 2>/dev/null; done; }
+reset() { for s in w p d h missing; do rm -rf "$CELL_DIR/$s"; tmux kill-session -t $s 2>/dev/null; done; }
 
 # ═══════════════════════════════════════════
 echo "═══ agent-tty test suite ═══"
@@ -50,11 +61,52 @@ echo ""
 # ── BASH BASICS ──
 reset
 echo "── bash basics ──"
+check_exact "k-version" "agent-tty $VERSION" "$($K --version)"
+check_exact "k-version-short" "agent-tty $VERSION" "$($K -V)"
+check_exact "k-version-word" "agent-tty $VERSION" "$($K version)"
+check_exact "km-version" "agent-tty $VERSION" "$($KM --version)"
+check_exact "km-version-short" "agent-tty $VERSION" "$($KM -V)"
+check_exact "km-version-word" "agent-tty $VERSION" "$($KM version)"
+check "reject-dot-session" "invalid session name" "$($K new . bash 2>&1 || true)"
+check "poll-missing-session" "no session 'missing'; use k new missing bash" "$($K poll missing 2>&1 || true)"
+check "int-missing-session" "ERR no session 'missing'; use k new missing bash" "$($K int missing 2>&1 || true)"
 $K new w bash >/dev/null; sleep 1
+check "new-idempotent" "OK w (alive)" "$($K new w bash)"
+check "ls" "w" "$($K ls)"
+check "status-idle" "state=idle" "$($K status w)"
+check "run-bad-timeout" "ERR -t must be a positive integer" "$($K run -t abc w 'echo nope' 2>&1 || true)"
+check "run-zero-timeout" "ERR -t must be a positive integer" "$($K run -t 0 w 'echo nope' 2>&1 || true)"
+check "fire-negative-timeout" "ERR -t must be a positive integer" "$($K fire -t -5 w 'echo nope' 2>&1 || true)"
+check "history-bad-n" "ERR -n must be a positive integer" "$($K history -n xyz w 2>&1 || true)"
 check "echo"        "hello"     "$($K run -j w 'echo hello')"
+check_exact "run-text" "textmode" "$($K run w 'echo textmode')"
 check "empty-out"   '"output": ""'   "$($K run -j w 'true')"
 check "multi-cmd"   "world"     "$($K run -j w 'echo hello && echo world')"
 check "unicode"     "你好"      "$($K run -j w 'echo 你好')"
+check "invalid-cell-id" "invalid cell_id" "$($K poll w not-a-cell)"
+check "notify" "OK notified: deploy complete" "$($K notify w 'deploy complete')"
+check "history" "deploy complete" "$($K history -n 5 w)"
+WATCH_CAPTURE=$(python3 - "$K_ABS" <<'PY'
+import signal
+import subprocess
+import sys
+import time
+
+k = sys.argv[1]
+p = subprocess.Popen([k, "watch", "w"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+time.sleep(0.5)
+subprocess.run([k, "notify", "w", "watch_ping"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(0.5)
+p.send_signal(signal.SIGINT)
+try:
+    out, _ = p.communicate(timeout=3)
+except subprocess.TimeoutExpired:
+    p.kill()
+    out, _ = p.communicate()
+print(out, end="")
+PY
+)
+check "watch" "watch_ping" "$WATCH_CAPTURE"
 
 # ── BASH PERSISTENCE ──
 echo "── bash persistence ──"
@@ -74,6 +126,9 @@ echo "── bash multi-line ──"
 $K new w bash >/dev/null; sleep 1
 OUT="$($K run -j w $'echo first\necho second' | out)"
 check_exact "two-line-output" $'first\nsecond' "$OUT"
+$K run -j w $'export MLINE=sticky\nmkdir -p /tmp/agent_tty_multiline\ncd /tmp/agent_tty_multiline\nmlfn(){ echo fn:$MLINE; }' >/dev/null
+OUT="$($K run -j w $'pwd\necho env:$MLINE\nmlfn' | out)"
+check_exact "multiline-state" $'/tmp/agent_tty_multiline\nenv:sticky\nfn:sticky' "$OUT"
 check "for" "c" "$($K run -j w '
 for i in a b c; do
     echo $i
@@ -132,7 +187,11 @@ echo "── fire/poll ──"
 $K new w bash >/dev/null; sleep 1
 CID=$($K fire w "sleep 1 && echo ASYNC" | cid)
 check "running"     "running"   "$($K poll w "$CID")"
+check "status-running" "next='k poll w $CID or k int w'" "$($K status w)"
 sleep 2
+KM_DONE=$($KM w "$CID" -1)
+check "km-oneshot-done" '"status": "done"' "$KM_DONE"
+check "km-oneshot-filter" "\"cell_id\": \"$CID\"" "$KM_DONE"
 check "done"        "ASYNC"     "$($K poll w "$CID")"
 
 # ── LOCK ──
@@ -187,9 +246,34 @@ cleanup w
 reset
 echo "── fire timeout ──"
 $K new w bash >/dev/null; sleep 1
-check "fire-t"      "fired"     "$($K fire -t 600 w 'echo long_job')"
-sleep 2; $K poll w >/dev/null
+FIRE_OUT=$($K fire -t 1 w 'sleep 30')
+CID=$(echo "$FIRE_OUT" | cid)
+check "fire-t"      "fired"     "$FIRE_OUT"
+sleep 2
+check "timeout-first" '"status": "timeout"' "$($K poll w "$CID")"
+check "timeout-hint" "use k int or k kill" "$($K poll w "$CID")"
+$K int w >/dev/null
+sleep 1
+check "timeout-recover" "after_timeout" "$($K run -j -t 5 w 'echo after_timeout')"
 cleanup w
+
+# ── HOOK RELATIVE PATH ──
+reset
+echo "── hook relative path ──"
+HOOK_TMP=$(mktemp -d)
+cat > "$HOOK_TMP/detect.sh" <<'HOOK'
+#!/bin/sh
+while IFS= read -r line; do
+    [ "$line" = "HOOK_DONE" ] && exit 0
+done
+exit 1
+HOOK
+chmod +x "$HOOK_TMP/detect.sh"
+(cd "$HOOK_TMP" && "$K_ABS" new h bash --prompt=./detect.sh >/dev/null)
+sleep 1
+check "hook-relative" "HOOK_OK" "$($K run -j h 'echo HOOK_OK; echo HOOK_DONE')"
+cleanup h
+rm -rf "$HOOK_TMP"
 
 # ── ORPHAN DETECTION ──
 reset
@@ -201,6 +285,8 @@ BG_PGID=$(python3 -c "import json;print(json.load(open('$CELL_DIR/w/_lock.json')
 kill -9 "-$BG_PGID" 2>/dev/null
 sleep 1
 check "orphan"      "watcher died" "$($K poll w "$CID")"
+check "orphan-locked" "active cell" "$($K run -j -t 1 w 'echo nope')"
+check "orphan-timeout-hint" "use k int or k kill" "$($K poll w "$CID")"
 # sleep 60 is still running in REPL — need to cancel it
 $K int w >/dev/null
 sleep 1

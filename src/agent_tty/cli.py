@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-tty / k -- persistent terminal sessions for AI agents
+agent-tty / k -- persistent REPL for AI agents, shared live terminal for humans
 
 Usage:
   k new    <session> [cmd...] [--prompt="x"]  spawn session (default: bash)
@@ -13,9 +13,11 @@ Usage:
   k int    [session]                          ctrl-c
   k kill   <session>                          kill + cleanup
   k ls                                        list sessions
-  k status [session]                          health check
+  k status [session]                          health + next action
   k watch  [session]                          live filtered view
   k history [-n N] [session]                  last N*5 lines (default 5)
+  k --version                                 print agent-tty version
+                                             aliases: k -V, k version
 
 Session resolves: explicit arg > K_SESSION env > auto-detect.
 
@@ -34,8 +36,9 @@ JSON output (-j / fire / poll):
   error:        {"status": "error", "output": "..."}
   cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 
-  Errors without cell_id: no session, active cell, pipe failed, send failed, no active cell
-  Errors with cell_id:    interrupted, unknown cell, watcher died, lock update failed, interrupt failed
+  JSON errors without cell_id: no session 'x'; use k new x bash, active cell '{id}', pipe failed, send failed, no active cell on 'x', invalid cell_id
+  JSON errors with cell_id:    interrupted, unknown cell, watcher died, result missing, lock update failed; use k int or k kill, lock release failed, interrupt failed; use k kill
+  Text errors: no session found; use k ls or k new <session> bash, no log for 'x'; use k status x, watcher kill failed; use k kill
 
 Timeout: lock is NOT released (command may still be running).
   Only k int or k kill releases. k int sends ctrl-c, writes interrupted, releases lock.
@@ -45,20 +48,30 @@ Monitor (separate command):
                                  -1 = exit after first completion (one-shot)
   Events: fired, done, timeout, interrupted, notify, closed, error (all include "ts" field)
 """
-import fcntl, json, os, re, shlex, signal, shutil, subprocess, sys, time, uuid
+import json, os, re, shlex, signal, shutil, subprocess, sys, time, uuid
 
 # ensure package importable when run as standalone script (_bg subprocess)
 _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
+from agent_tty import __version__  # noqa: E402
+
+_VERSION_ARGS = ("--version", "-V", "version")
+if len(sys.argv) >= 2 and sys.argv[1] in _VERSION_ARGS:
+    print(f"agent-tty {__version__}")
+    sys.exit(0)
+
 from agent_tty._shared import (  # noqa: E402
-    TMUX, ANSI_RE, FRAME_ENTERS, CELL_DIR,
+    TMUX, TAIL, ANSI_RE, FRAME_ENTERS, CELL_DIR,
     FIRED, DONE, TIMEOUT, INTERRUPTED, RUNNING, ERROR, NOTIFY,
     cell_event, notify_event,
     CELL_EVENT_RE, NOTIFY_EVENT_RE,
-    ensure_private_dir, validate_cell_id, validate_name,
+    ensure_private_dir, open_private as _open_private,
+    validate_cell_id, validate_name,
 )
+
+import fcntl  # noqa: E402
 
 
 # ═══════════════════════════════════════════
@@ -114,30 +127,34 @@ def _lock_guard_path(s): return os.path.join(_session_dir(s), "_lock.guard")
 def _log(s):    return os.path.join(_session_dir(s), "_output.log")
 def _result(s, cid): return os.path.join(_session_dir(s), f"{validate_cell_id(cid)}_result.json")
 
-def _open_private(path, flags, mode="r"):
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        return os.fdopen(fd, mode)
-    except Exception:
-        os.close(fd)
-        raise
+class LockBusy(Exception):
+    """Raised when a non-blocking LockGuard cannot acquire the mutex."""
+
 
 class LockGuard:
     """Proof token: caller holds the per-session lock-file mutex."""
-    def __init__(self, session):
+    def __init__(self, session, blocking=True):
         self.session = session
+        self.blocking = blocking
         self._f = None
 
     def __enter__(self):
         self._f = _open_private(_lock_guard_path(self.session),
                                 os.O_RDWR | os.O_CREAT, "r+")
-        fcntl.flock(self._f.fileno(), fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX
+        if not self.blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(self._f.fileno(), flags)
+        except BlockingIOError:
+            self._f.close()
+            self._f = None
+            raise LockBusy
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._f is None:
+            return False
         try:
             fcntl.flock(self._f.fileno(), fcntl.LOCK_UN)
         finally:
@@ -157,7 +174,8 @@ def _log_event(s, event):
     try:
         with _open_private(_log(s), os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a") as f:
             f.write(f"\n{event}\n")
-    except OSError: pass
+    except OSError as e:
+        print(f"WARN log event failed for {s}: {e}", file=sys.stderr)
 
 def _resolve(explicit=None):
     if explicit:
@@ -180,6 +198,30 @@ def _emit(json_out, data, text=None):
     """Unified output: JSON mode → _json(data), text mode → print(text)."""
     if json_out: _json(data)
     else: print(text if text is not None else data.get("output", ""))
+
+def _no_session_output(session=None):
+    if session:
+        return f"no session '{session}'; use k new {session} bash"
+    return "no session found; use k ls or k new <session> bash"
+
+def _no_log_output(session):
+    return f"no log for '{session}'; use k status {session}"
+
+def _warn(message):
+    print(f"WARN {message}", file=sys.stderr)
+
+def _parse_positive_int(raw, option, usage):
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"ERR {option} must be a positive integer")
+        print(usage)
+        return None
+    if value <= 0:
+        print(f"ERR {option} must be a positive integer")
+        print(usage)
+        return None
+    return value
 
 def _watcher_pgid(meta):
     """Return watcher process group id."""
@@ -242,12 +284,15 @@ def _write_result(session, cell_id, result):
         os.fsync(f.fileno())
     os.replace(tmp, rpath)
 
-def _update_lock(session, cell_id=None, **kw):
+def _update_lock(session, cell_id=None, *, blocking=True, **kw):
     """Read-modify-write lock file via atomic tmp+replace.
     If cell_id given, verify it matches.
     Returns True on success, False on failure or cell_id mismatch."""
-    with LockGuard(session):
-        return _update_lock_unlocked(session, cell_id, **kw)
+    try:
+        with LockGuard(session, blocking=blocking):
+            return _update_lock_unlocked(session, cell_id, **kw)
+    except LockBusy:
+        return False
 
 def _update_lock_unlocked(session, cell_id=None, **kw):
     try:
@@ -264,18 +309,45 @@ def _update_lock_unlocked(session, cell_id=None, **kw):
             os.fsync(f.fileno())
         os.replace(tmp, lock)
         return True
-    except Exception:
+    except Exception as e:
+        _warn(f"lock update failed for {session}: {e}")
         return False
 
-def _mark_terminal(session, cell_id, status):
-    """Record terminal state on the lock without deleting it."""
+def _terminal_fields(status):
     if status == TIMEOUT:
-        return _update_lock(session, cell_id=cell_id,
-                            timed_out=True, terminal_status=TIMEOUT)
+        return {"timed_out": True, "terminal_status": TIMEOUT}
     if status == DONE:
-        return _update_lock(session, cell_id=cell_id,
-                            completed=True, terminal_status=DONE)
-    return _update_lock(session, cell_id=cell_id, terminal_status=status)
+        return {"completed": True, "terminal_status": DONE}
+    return {"terminal_status": status}
+
+
+def _mark_terminal(session, cell_id, status, *, blocking=True):
+    """Record terminal state on the lock without deleting it."""
+    return _update_lock(session, cell_id=cell_id, blocking=blocking,
+                        **_terminal_fields(status))
+
+
+def _commit_terminal_result(session, cell_id, result, *, blocking=True):
+    """Commit terminal state, result file, and event log under one lock proof."""
+    status = result.get("status")
+    deadline = time.monotonic() + 0.25
+    while True:
+        try:
+            with LockGuard(session, blocking=blocking):
+                if not _update_lock_unlocked(session, cell_id=cell_id,
+                                             **_terminal_fields(status)):
+                    return False
+                _write_result(session, cell_id, result)
+                if status == TIMEOUT:
+                    _log_event(session, cell_event(cell_id, TIMEOUT))
+                elif status == DONE:
+                    _log_event(session, cell_event(cell_id, DONE))
+                    _cleanup_input_script(session, cell_id)
+                return True
+        except LockBusy:
+            if blocking or time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
 
 # ═══════════════════════════════════════════
@@ -283,15 +355,31 @@ def _mark_terminal(session, cell_id, status):
 # ═══════════════════════════════════════════
 
 def _create(session, cmd, prompt=None):
-    T.spawn(session, cmd)
-    _session_dir(session)
-    _ensure_pipe(session)
-    time.sleep(1.0)
-    meta = {"name": session, "cmd": cmd}
-    if prompt:
-        meta["prompt"] = prompt  # explicit prompt → exact match mode
-    with _open_private(_meta(session), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "w") as f:
-        json.dump(meta, f)
+    spawned = False
+    created_dir = None
+    try:
+        T.spawn(session, cmd)
+        spawned = True
+        created_dir = _session_dir(session)
+        _ensure_pipe(session)
+        time.sleep(1.0)
+        meta = {"name": session, "cmd": cmd}
+        if prompt:
+            meta["prompt"] = prompt  # explicit prompt → exact match mode
+        with _open_private(_meta(session), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "w") as f:
+            json.dump(meta, f)
+    except BaseException:
+        if spawned:
+            try:
+                T.kill(session)
+            except Exception as e:
+                _warn(f"create rollback failed to kill {session}: {e}")
+        if created_dir:
+            try:
+                shutil.rmtree(created_dir)
+            except Exception as e:
+                _warn(f"create rollback failed to remove {created_dir}: {e}")
+        raise
 
 def _session_exists(session):
     return T.has(session) and os.path.exists(_meta(session))
@@ -300,13 +388,16 @@ def _session_prompt(session):
     """Returns explicit prompt if set, None for default repeat-detection."""
     try:
         with _open_private(_meta(session), os.O_RDONLY, "r") as f: return json.load(f).get("prompt")
-    except Exception: return None
+    except Exception as e:
+        _warn(f"session metadata prompt read failed for {session}: {e}")
+        return None
 
 def _session_cmd(session):
     try:
         with _open_private(_meta(session), os.O_RDONLY, "r") as f:
             return json.load(f).get("cmd")
-    except Exception:
+    except Exception as e:
+        _warn(f"session metadata command read failed for {session}: {e}")
         return None
 
 
@@ -324,21 +415,17 @@ def _acquire_unlocked(session, cell_id, log_offset, echo_count):
     meta = {"cell_id": cell_id, "log_offset": log_offset, "echo_count": echo_count}
     for _ in range(2):
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(lock, flags, 0o600)
-            try:
-                os.write(fd, json.dumps(meta).encode())
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            with _open_private(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "w") as f:
+                json.dump(meta, f)
+                f.flush()
+                os.fsync(f.fileno())
             return None
         except FileExistsError:
             try:
                 with _open_private(lock, os.O_RDONLY, "r") as f:
                     held = json.load(f)
-            except Exception:
+            except Exception as e:
+                _warn(f"active lock read failed for {session}: {e}")
                 return "?"
             held_id = held.get("cell_id", "?")
             if held.get("completed") and held.get("terminal_status") == DONE:
@@ -350,10 +437,33 @@ def _acquire_unlocked(session, cell_id, log_offset, echo_count):
 def _load_cell(session):
     try:
         with _open_private(_lock(session), os.O_RDONLY, "r") as f: return json.load(f)
-    except Exception: return None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        _warn(f"active cell read failed for {session}: {e}")
+        return None
 
 def _release(session, cell_id):
     with LockGuard(session):
+        return _release_unlocked(session, cell_id)
+
+def _release_if_current(session, cell_id):
+    """Release only if the active lock still belongs to cell_id.
+
+    Explicit polling of an old result must not fail just because a newer cell
+    now owns the session lock.
+    """
+    with LockGuard(session):
+        try:
+            with _open_private(_lock(session), os.O_RDONLY, "r") as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return True
+        except Exception as e:
+            _warn(f"lock release check failed for {session}/{cell_id}: {e}")
+            return False
+        if meta.get("cell_id") != cell_id:
+            return True
         return _release_unlocked(session, cell_id)
 
 def _release_unlocked(session, cell_id):
@@ -364,10 +474,12 @@ def _release_unlocked(session, cell_id):
         # Close the read handle before unlinking the lock file.
         if meta.get("cell_id") == cell_id:
             os.unlink(lock)
-        return True
+            return True
+        return False
     except FileNotFoundError:
         return True
-    except Exception:
+    except Exception as e:
+        _warn(f"lock release failed for {session}/{cell_id}: {e}")
         return False
 
 
@@ -379,17 +491,20 @@ def _send_interrupt(session):
     prompt = _session_prompt(session)
     try:
         T.send_int(session)
-    except Exception:
+    except Exception as e:
         # Ctrl-C didn't reach REPL. If session is dead, nothing is running → safe.
         # If session is alive, command may still be running → unsafe to release.
-        return not T.has(session)
+        alive = T.has(session)
+        if alive:
+            _warn(f"interrupt failed for {session}: {e}")
+        return not alive
     time.sleep(0.3)
     # re-frame is best-effort (Ctrl-C already delivered)
     if not prompt:
         try:
             _send_frame_enters(session)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"WARN re-frame after interrupt failed for {session}: {e}", file=sys.stderr)
     return True
 
 
@@ -408,14 +523,18 @@ class CellLock:
     def __init__(self, session, cell_id, log_offset, echo_count):
         self.session = session
         self.cell_id = cell_id
+        self.log_offset = log_offset
+        self.echo_count = echo_count
         self.sent = False
         self.keep = False
         self.interrupt_failed = False
-        held = _acquire(session, cell_id, log_offset, echo_count)
-        if held:
-            raise CellBusy(held)
+        self.acquired = False
 
     def __enter__(self):
+        held = _acquire(self.session, self.cell_id, self.log_offset, self.echo_count)
+        if held:
+            raise CellBusy(held)
+        self.acquired = True
         return self
 
     def mark_sent(self):
@@ -425,6 +544,8 @@ class CellLock:
         self.keep = True
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.acquired:
+            return False
         if self.keep:
             return False
         if exc_type is not None and self.sent:
@@ -438,7 +559,8 @@ class CellLock:
         try:
             rpath = _result(self.session, self.cell_id)
             if os.path.exists(rpath): os.unlink(rpath)
-        except OSError: pass
+        except OSError as e:
+            print(f"WARN result cleanup failed for {self.session}/{self.cell_id}: {e}", file=sys.stderr)
         _cleanup_input_script(self.session, self.cell_id)
         return False
 
@@ -460,7 +582,7 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
     state = "OUTPUT" if echo_count <= 0 else "ECHOING"
     remaining = echo_count
     output = []
-    deadline = time.monotonic() + timeout if timeout else None
+    deadline = time.monotonic() + timeout if timeout is not None else None
     repeat_count = 0
     last_clean = None
 
@@ -477,10 +599,10 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
     timed_out = False
 
     try:
-        with open(logpath, "r", errors="replace") as f:
+        with _open_private(logpath, os.O_RDONLY, "r", errors="replace") as f:
             f.seek(log_offset)
             while True:
-                if deadline and time.monotonic() > deadline:
+                if deadline is not None and time.monotonic() > deadline:
                     timed_out = True
                     break
 
@@ -498,7 +620,7 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
                 if not clean:
                     continue
 
-                if clean.startswith("── cell:") or clean.startswith("── notify "):
+                if CELL_EVENT_RE.match(clean) or NOTIFY_EVENT_RE.match(clean):
                     continue
 
                 if state == "ECHOING":
@@ -550,6 +672,11 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
                     last_clean = clean
     finally:
         if hook:
+            if hook.stdin:
+                try:
+                    hook.stdin.close()
+                except OSError as e:
+                    print(f"WARN hook stdin close failed for {session}/{cell_id}: {e}", file=sys.stderr)
             if hook.poll() is None:
                 hook.kill()
             hook.wait()
@@ -560,15 +687,11 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
         "output": "" if timed_out else "\n".join(output)
     }
 
-    _write_result(session, cell_id, result)
-    _mark_terminal(session, cell_id, result["status"])
-    if timed_out:
-        _log_event(session, cell_event(cell_id, TIMEOUT))
-    else:
-        _log_event(session, cell_event(cell_id, DONE))
-        _cleanup_input_script(session, cell_id)
+    if _commit_terminal_result(session, cell_id, result, blocking=False):
+        return result
 
-    return result
+    _cleanup_input_script(session, cell_id)
+    return {"cell_id": cell_id, "status": ERROR, "output": "interrupted"}
 
 
 def _echo_count(code):
@@ -588,7 +711,14 @@ def _looks_like_bash(cmd):
         return False
     if not parts:
         return False
-    return os.path.basename(parts[0]) == "bash"
+    i = 0
+    if os.path.basename(parts[0]) == "env":
+        i = 1
+        while i < len(parts) and (parts[i].startswith("-") or ("=" in parts[i] and not parts[i].startswith("="))):
+            i += 1
+    if i >= len(parts):
+        return False
+    return os.path.basename(parts[i]) == "bash"
 
 def _has_multiple_code_lines(code):
     return _echo_count(code) > 1
@@ -611,9 +741,9 @@ def _cleanup_input_script(session, cell_id):
     try:
         os.unlink(_input_script(session, cell_id))
     except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+        return
+    except OSError as e:
+        print(f"WARN input script cleanup failed for {session}/{cell_id}: {e}", file=sys.stderr)
 
 def _should_source_bash(session, code, prompt):
     return (
@@ -635,6 +765,10 @@ def _send_frame_enters(session):
     subprocess.run(args, check=True)
 
 
+def _is_hook_prompt(prompt):
+    return bool(prompt and os.path.isabs(prompt) and os.path.isfile(prompt))
+
+
 def _send_code(session, code, prompt=None):
     """Send code via paste-buffer (no per-char echo) + frame enters."""
     code_lines = code.lstrip().split("\n")
@@ -645,7 +779,7 @@ def _send_code(session, code, prompt=None):
     subprocess.run([TMUX, "load-buffer", "-b", buf, "-"], input=text.encode(), check=True)
     subprocess.run([TMUX, "paste-buffer", "-b", buf, "-d", "-t", session], check=True)
 
-    if not prompt:
+    if not prompt or _is_hook_prompt(prompt):
         _send_frame_enters(session)
 
 
@@ -668,7 +802,11 @@ def cmd_new(session, cmd_parts, prompt=None):
         if not os.access(prompt, os.X_OK):
             print(f"ERR hook not executable: {prompt}"); return 1
     cmd = " ".join(cmd_parts) if cmd_parts else "bash"
-    _create(session, cmd, prompt)
+    try:
+        _create(session, cmd, prompt)
+    except Exception as e:
+        print(f"ERR create failed: {e}")
+        return 1
     if prompt:
         print(f"OK {session} prompt={repr(prompt)}")
     else:
@@ -678,7 +816,7 @@ def cmd_new(session, cmd_parts, prompt=None):
 
 def cmd_fire(session, code, timeout=300):
     if not _session_exists(session):
-        _json({"status": "error", "output": f"no session '{session}'"}); return 1
+        _json({"status": ERROR, "output": _no_session_output(session)}); return 1
 
     cell_id = uuid.uuid4().hex[:12]
     prompt = _session_prompt(session)
@@ -687,25 +825,21 @@ def cmd_fire(session, code, timeout=300):
     echo_count = _echo_count(send_code)
     log_offset = _log_size(session)
 
-    try:
-        lock = CellLock(session, cell_id, log_offset, echo_count)
-    except CellBusy as e:
-        _json({"status": "error", "output": f"active cell '{e.held_id}'"}); return 1
-
+    lock = CellLock(session, cell_id, log_offset, echo_count)
     bg = None
     try:
         with lock:
             try:
                 _ensure_pipe(session)
             except Exception as e:
-                _json({"status": "error", "output": f"pipe failed: {e}"}); return 1
+                _json({"status": ERROR, "output": f"pipe failed: {e}"}); return 1
 
             try:
                 if source_bash:
                     _write_input_script(session, cell_id, code)
                 _send_code(session, send_code, prompt)
             except Exception as e:
-                _json({"status": "error", "output": f"send failed: {e}"}); return 1
+                _json({"status": ERROR, "output": f"send failed: {e}"}); return 1
 
             lock.mark_sent()
             _log_event(session, cell_event(cell_id, FIRED))
@@ -724,11 +858,13 @@ def cmd_fire(session, code, timeout=300):
                 raise RuntimeError("lock update failed")
 
             lock.mark_keep()  # bg process owns the lock now
+    except CellBusy as e:
+        _json({"status": ERROR, "output": f"active cell '{e.held_id}'"}); return 1
     except (Exception, KeyboardInterrupt):
         if bg is not None and not lock.keep:
             _kill_watcher({"bg_pgid": bg.pid})
         msg = "interrupt failed; use k kill" if lock.interrupt_failed else "interrupted"
-        _json({"cell_id": cell_id, "status": "error", "output": msg})
+        _json({"cell_id": cell_id, "status": ERROR, "output": msg})
         return 1
 
     _json({"cell_id": cell_id, "status": FIRED})
@@ -736,40 +872,52 @@ def cmd_fire(session, code, timeout=300):
 
 
 def cmd_poll(session, cell_id=None):
+    validate_name(session)
+    if not _session_exists(session):
+        _json({"status": ERROR, "output": _no_session_output(session)})
+        return 1
     if cell_id is None:
         meta = _load_cell(session)
         if not meta:
-            _json({"status": "error", "output": f"no active cell on '{session}'"}); return 1
+            _json({"status": ERROR, "output": f"no active cell on '{session}'"}); return 1
         cell_id = meta["cell_id"]
     try:
         cell_id = validate_cell_id(cell_id)
     except ValueError:
-        _json({"status": "error", "output": "invalid cell_id"})
+        _json({"status": ERROR, "output": "invalid cell_id"})
         return 1
 
     rpath = _result(session, cell_id)
     if os.path.exists(rpath):
         try:
-            with open(rpath) as f: result = json.load(f)
+            with _open_private(rpath, os.O_RDONLY, "r") as f: result = json.load(f)
         except (json.JSONDecodeError, OSError):
             # atomic writes make this near-impossible; if it happens,
             # do NOT release lock — state is unknown, let user k int / k kill
-            _json({"cell_id": cell_id, "status": "running"})
+            _json({"cell_id": cell_id, "status": RUNNING})
             return 0
         if result.get("status") == TIMEOUT:
+            meta = _load_cell(session)
+            if meta and meta.get("cell_id") == cell_id and meta.get("timeout_polled"):
+                _json({"cell_id": cell_id, "status": TIMEOUT, "output": "use k int or k kill"})
+                return 1
             # mark lock BEFORE returning; timeout means REPL may still be busy
-            if not _mark_terminal(session, cell_id, TIMEOUT):
-                _json({"cell_id": cell_id, "status": "error", "output": "lock update failed; use k int or k kill"})
+            if not _update_lock(session, cell_id=cell_id,
+                                timed_out=True, terminal_status=TIMEOUT,
+                                timeout_polled=True):
+                _json({"cell_id": cell_id, "status": ERROR, "output": "lock update failed; use k int or k kill"})
                 return 1
             # leave timeout result on disk — subsequent polls re-read it (idempotent)
             # prevents race where k int writes interrupted result between our read and unlink
         else:
-            # non-timeout: release first, then consume result
-            if not _release(session, cell_id):
-                _json({"cell_id": cell_id, "status": "error", "output": "lock release failed"})
+            # non-timeout: release only if this cell still owns the active lock,
+            # then consume result. Old explicit polls must not touch a new cell.
+            if not _release_if_current(session, cell_id):
+                _json({"cell_id": cell_id, "status": ERROR, "output": "lock release failed"})
                 return 1
             try: os.unlink(rpath)
-            except OSError: pass
+            except OSError as e:
+                print(f"WARN result cleanup failed for {session}/{cell_id}: {e}", file=sys.stderr)
         _json(result)
         return 0
 
@@ -778,20 +926,22 @@ def cmd_poll(session, cell_id=None):
 
     # no lock, or lock is for a different cell → this cell_id is unknown
     if not meta or meta.get("cell_id") != cell_id:
-        _json({"cell_id": cell_id, "status": "error", "output": "unknown cell"})
+        _json({"cell_id": cell_id, "status": ERROR, "output": "unknown cell"})
         return 1
 
     # completed done-lock: bg watcher finished, but nobody polled the result.
     # Release so the next fire/run can proceed; explicit poll <old_cell> can
     # still consume the result file if it exists.
     if meta.get("completed") and meta.get("terminal_status") == DONE:
-        _release(session, cell_id)
-        _json({"cell_id": cell_id, "status": "error", "output": "result missing"})
+        if not _release(session, cell_id):
+            _json({"cell_id": cell_id, "status": ERROR, "output": "lock release failed"})
+            return 1
+        _json({"cell_id": cell_id, "status": ERROR, "output": "result missing"})
         return 1
 
     # timed_out: command may still be running — only k int / k kill can release
     if meta.get("timed_out"):
-        _json({"cell_id": cell_id, "status": "timeout", "output": "use k int or k kill"})
+        _json({"cell_id": cell_id, "status": TIMEOUT, "output": "use k int or k kill"})
         return 1
 
     # check if bg process died (orphaned lock)
@@ -801,16 +951,16 @@ def cmd_poll(session, cell_id=None):
             # so user must k int / k kill to recover safely
             _mark_terminal(session, cell_id, TIMEOUT)
             _log_event(session, cell_event(cell_id, TIMEOUT))
-            _json({"cell_id": cell_id, "status": "error", "output": "watcher died"})
+            _json({"cell_id": cell_id, "status": ERROR, "output": "watcher died"})
             return 1
 
-    _json({"cell_id": cell_id, "status": "running"})
+    _json({"cell_id": cell_id, "status": RUNNING})
     return 0
 
 
 def cmd_run(session, code, timeout=30, json_out=False):
     if not _session_exists(session):
-        _emit(json_out, {"status": "error", "output": f"no session '{session}'"})
+        _emit(json_out, {"status": ERROR, "output": _no_session_output(session)})
         return 1
 
     prompt = _session_prompt(session)
@@ -820,18 +970,13 @@ def cmd_run(session, code, timeout=30, json_out=False):
     echo_count = _echo_count(send_code)
     log_offset = _log_size(session)
 
-    try:
-        lock = CellLock(session, cell_id, log_offset, echo_count)
-    except CellBusy as e:
-        _emit(json_out, {"status": "error", "output": f"active cell '{e.held_id}'"})
-        return 1
-
+    lock = CellLock(session, cell_id, log_offset, echo_count)
     try:
         with lock:
             try:
                 _ensure_pipe(session)
             except Exception as e:
-                _emit(json_out, {"status": "error", "output": f"pipe failed: {e}"})
+                _emit(json_out, {"status": ERROR, "output": f"pipe failed: {e}"})
                 return 1
 
             try:
@@ -839,59 +984,72 @@ def cmd_run(session, code, timeout=30, json_out=False):
                     _write_input_script(session, cell_id, code)
                 _send_code(session, send_code, prompt)
             except Exception as e:
-                _emit(json_out, {"status": "error", "output": f"send failed: {e}"})
+                _emit(json_out, {"status": ERROR, "output": f"send failed: {e}"})
                 return 1
 
             lock.mark_sent()
+            _log_event(session, cell_event(cell_id, FIRED))
             result = _stream_process(session, cell_id, log_offset, echo_count, timeout, prompt)
 
             if result.get("status") == TIMEOUT:
                 lock.mark_keep()
+    except CellBusy as e:
+        _emit(json_out, {"status": ERROR, "output": f"active cell '{e.held_id}'"})
+        return 1
     except (Exception, KeyboardInterrupt):
         # CellLock.__exit__ handled cleanup (interrupt recovery or lock kept)
         msg = "interrupt failed; use k kill" if lock.interrupt_failed else "interrupted"
-        _emit(json_out, {"cell_id": cell_id, "status": "error", "output": msg})
+        if lock.sent and not lock.interrupt_failed:
+            _log_event(session, cell_event(cell_id, INTERRUPTED))
+        _emit(json_out, {"cell_id": cell_id, "status": ERROR, "output": msg})
         return 1
 
     _emit(json_out, result)
-    return 0
+    return 1 if result.get("status") == ERROR else 0
 
 
 def cmd_notify(session, message):
     if not _session_exists(session):
-        print(f"ERR no session '{session}'"); return 1
-    try: parent = open(f"/proc/{os.getppid()}/comm").read().strip()
-    except Exception: parent = "?"
+        print(f"ERR {_no_session_output(session)}"); return 1
+    try:
+        with open(f"/proc/{os.getppid()}/comm") as f:
+            parent = f.read().strip()
+    except OSError: parent = "?"
     _log_event(session, notify_event(f"{parent}@k:{os.getpid()}", message))
     print(f"OK notified: {message}")
     return 0
 
 
 def cmd_int(s):
-    meta = _load_cell(s)
-    if meta and meta.get("completed") and meta.get("terminal_status") == DONE:
-        cell_id = meta["cell_id"]
-        if not _release(s, cell_id):
-            print("ERR lock release failed"); return 1
-        _cleanup_input_script(s, cell_id)
-        print("OK"); return 0
-    if not _send_interrupt(s):
-        print("ERR interrupt failed; use k kill"); return 1
-    # kill bg watcher (if any) before releasing lock
-    # prevents old watcher from consuming new cell's output
-    if meta:
-        cell_id = meta["cell_id"]
-        if _watcher_pgid(meta) and not _kill_watcher(meta):
-            print("ERR watcher kill failed; use k kill"); return 1
-        # write result so poll finds closure — overwrites timeout result too
-        _write_result(s, cell_id, {"cell_id": cell_id, "status": "error", "output": "interrupted"})
-        _log_event(s, cell_event(cell_id, INTERRUPTED))
-        if not _release(s, cell_id):
-            print("ERR lock release failed"); return 1
-        _cleanup_input_script(s, cell_id)
+    validate_name(s)
+    if not _session_exists(s):
+        print(f"ERR {_no_session_output(s)}"); return 1
+    with LockGuard(s):
+        meta = _load_cell(s)
+        if meta and meta.get("completed") and meta.get("terminal_status") == DONE:
+            cell_id = meta["cell_id"]
+            if not _release_unlocked(s, cell_id):
+                print("ERR lock release failed"); return 1
+            _cleanup_input_script(s, cell_id)
+            print("OK"); return 0
+        if not _send_interrupt(s):
+            print("ERR interrupt failed; use k kill"); return 1
+        # kill bg watcher (if any) before releasing lock
+        # prevents old watcher from consuming new cell's output
+        if meta:
+            cell_id = meta["cell_id"]
+            if _watcher_pgid(meta) and not _kill_watcher(meta):
+                print("ERR watcher kill failed; use k kill"); return 1
+            # write result so poll finds closure — overwrites timeout result too
+            _write_result(s, cell_id, {"cell_id": cell_id, "status": ERROR, "output": "interrupted"})
+            _log_event(s, cell_event(cell_id, INTERRUPTED))
+            if not _release_unlocked(s, cell_id):
+                print("ERR lock release failed"); return 1
+            _cleanup_input_script(s, cell_id)
     print("OK"); return 0
 
 def cmd_kill(s):
+    validate_name(s)
     # kill bg watcher if running
     meta = _load_cell(s)
     if meta:
@@ -905,19 +1063,38 @@ def cmd_ls():
     s = T.ls(); print(s if s else "no sessions"); return 0
 
 def cmd_status(session):
-    if not _session_exists(session): print(f"ERR no session '{session}'"); return 1
+    if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
     pipe_ok = False
-    if os.path.exists(logpath):
-        before = os.path.getsize(logpath)
-        subprocess.run([TMUX, "send-keys", "-t", session, " ", "BSpace"], capture_output=True)
-        time.sleep(0.2)
-        pipe_ok = (os.path.getsize(logpath) > before)
-    if not pipe_ok:
-        T.pipe_start(session, logpath)
-        print(f"OK {session} pipe=repaired")
-    else:
-        print(f"OK {session} pipe=ok")
+    try:
+        if os.path.exists(logpath):
+            before = os.path.getsize(logpath)
+            subprocess.run([TMUX, "send-keys", "-t", session, " ", "BSpace"], capture_output=True)
+            time.sleep(0.2)
+            pipe_ok = (os.path.getsize(logpath) > before)
+        if not pipe_ok:
+            T.pipe_start(session, logpath)
+            pipe = "repaired"
+        else:
+            pipe = "ok"
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"ERR pipe failed: {e}; use k kill {session}")
+        return 1
+    meta = _load_cell(session)
+    if not meta:
+        print(f"OK {session} pipe={pipe} state=idle next='k run {session} <code>'")
+        return 0
+    cell_id = meta.get("cell_id", "?")
+    if meta.get("completed") and meta.get("terminal_status") == DONE:
+        print(f"OK {session} pipe={pipe} state=done cell={cell_id} next='k poll {session} {cell_id}'")
+        return 0
+    if meta.get("timed_out"):
+        print(f"OK {session} pipe={pipe} state=timeout cell={cell_id} next='k int {session} or k kill {session}'")
+        return 0
+    if _watcher_pgid(meta) and not _watcher_alive(meta):
+        print(f"OK {session} pipe={pipe} state=watcher-dead cell={cell_id} next='k poll {session} {cell_id}'")
+        return 0
+    print(f"OK {session} pipe={pipe} state=running cell={cell_id} next='k poll {session} {cell_id} or k int {session}'")
     return 0
 
 
@@ -943,12 +1120,13 @@ def _filter_line(raw_line):
     return ANSI_RE.sub("", raw_line).rstrip()
 
 def cmd_watch(session):
-    if not _session_exists(session): print(f"ERR no session '{session}'"); return 1
+    if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
-    if not os.path.exists(logpath): print(f"ERR no log"); return 1
+    if not os.path.exists(logpath): print(f"ERR {_no_log_output(session)}"); return 1
     print(f"\033[2mwatching {session} (ctrl-c to stop)\033[0m\n")
+    proc = None
     try:
-        proc = subprocess.Popen(["tail", "-n", "0", "-f", logpath], stdout=subprocess.PIPE, text=True)
+        proc = subprocess.Popen([TAIL, "-n", "0", "-f", logpath], stdout=subprocess.PIPE, text=True, errors="replace")
         repeat_buf = []  # buffer identical lines; flush if run < FRAME_ENTERS
         for raw_line in proc.stdout:
             r = _filter_line(raw_line)
@@ -973,15 +1151,18 @@ def cmd_watch(session):
             for line in repeat_buf:
                 print(line)
     except KeyboardInterrupt: print(f"\n\033[2mstopped\033[0m")
+    except OSError as e:
+        print(f"ERR watch failed: {e}")
+        return 1
     finally:
-        if proc.poll() is None: proc.kill(); proc.wait()
+        if proc is not None and proc.poll() is None: proc.kill(); proc.wait()
     return 0
 
 def cmd_history(session, n=5):
-    if not _session_exists(session): print(f"ERR no session '{session}'"); return 1
+    if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
-    if not os.path.exists(logpath): print(f"ERR no log"); return 1
-    with open(logpath, "r", errors="replace") as f: raw_lines = f.readlines()
+    if not os.path.exists(logpath): print(f"ERR {_no_log_output(session)}"); return 1
+    with _open_private(logpath, os.O_RDONLY, "r", errors="replace") as f: raw_lines = f.readlines()
     filtered = [r for line in raw_lines if (r := _filter_line(line)) is not None]
     # suppress runs of FRAME_ENTERS+ identical lines (frame noise), keep shorter runs
     out = []
@@ -1026,61 +1207,70 @@ def main():
 
     if verb in ("run", "await"):
         timeout, json_out = 30, False
+        usage = "usage: k run [-j] [-t N] [session] <code>"
         while rest and rest[0].startswith("-"):
             if rest[0] == "-t":
-                if len(rest) < 2: print("usage: k run [-j] [-t N] [session] <code>"); return 1
-                timeout = int(rest[1]); rest = rest[2:]
+                if len(rest) < 2: print(usage); return 1
+                parsed = _parse_positive_int(rest[1], "-t", usage)
+                if parsed is None: return 1
+                timeout = parsed; rest = rest[2:]
             elif rest[0] == "-j": json_out = True; rest = rest[1:]
             else: break
         if len(rest) >= 2: s, c = rest[0], rest[1]; validate_name(s)
         elif len(rest) == 1: s, c = _resolve(), rest[0]
-        else: print("usage: k run [-j] [-t N] [session] <code>"); return 1
-        if not s: print("ERR: no session found."); return 1
+        else: print(usage); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_run(s, c, timeout, json_out)
 
     if verb == "fire" and rest:
         timeout = 300
+        usage = "usage: k fire [-t N] [session] <code>"
         while rest and rest[0].startswith("-"):
             if rest[0] == "-t":
-                if len(rest) < 2: print("usage: k fire [-t N] [session] <code>"); return 1
-                timeout = int(rest[1]); rest = rest[2:]
+                if len(rest) < 2: print(usage); return 1
+                parsed = _parse_positive_int(rest[1], "-t", usage)
+                if parsed is None: return 1
+                timeout = parsed; rest = rest[2:]
             else: break
         if len(rest) >= 2: s, c = rest[0], rest[1]; validate_name(s)
         else: s, c = _resolve(), rest[0]
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_fire(s, c, timeout)
 
     if verb == "poll":
         s = _resolve(rest[0] if rest else None)
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_poll(s, rest[1] if len(rest) >= 2 else None)
 
     if verb == "notify" and rest:
         if len(rest) >= 2 and T.has(rest[0]):
             validate_name(rest[0]); s, msg = rest[0], " ".join(rest[1:])
         else: s, msg = _resolve(), " ".join(rest)
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_notify(s, msg)
 
     if verb == "int":
         s = _resolve(rest[0] if rest else None)
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_int(s)
     if verb == "status":
         s = _resolve(rest[0] if rest else None)
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_status(s)
     if verb == "watch":
         s = _resolve(rest[0] if rest else None)
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_watch(s)
     if verb == "history":
         n = 5
         if rest and rest[0] == "-n":
-            if len(rest) < 2: print("usage: k history [-n N] [session]"); return 1
-            n = int(rest[1]); rest = rest[2:]
+            usage = "usage: k history [-n N] [session]"
+            if len(rest) < 2: print(usage); return 1
+            parsed = _parse_positive_int(rest[1], "-n", usage)
+            if parsed is None: return 1
+            n = parsed; rest = rest[2:]
         s = _resolve(rest[0] if rest else None)
-        if not s: print("ERR: no session found."); return 1
+        if not s: print(f"ERR {_no_session_output()}"); return 1
         return cmd_history(s, n)
 
     print(__doc__.strip()); return 1

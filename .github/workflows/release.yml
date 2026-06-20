@@ -88,6 +88,10 @@ jobs:
           k --help >/dev/null
           km --help >/dev/null
           python -m agent_tty --help >/dev/null
+          k --version
+          km --version
+          agent-tty --version
+          python -m agent_tty --version
 
       - name: Full test suite
         run: python tests/run_all.py k

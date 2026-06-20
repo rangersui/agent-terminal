@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-tty"
-version = "0.1.0"
-description = "Persistent terminal sessions for AI agents"
+version = "0.1.1"
+description = "Persistent REPL for AI agents, shared live terminal for humans"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 keywords = ["agent", "terminal", "tmux", "repl", "ai"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -29,3 +29,6 @@ Repository = "https://github.com/rangersui/agent-tty"
 agent-tty = "agent_tty.cli:main"
 k = "agent_tty.cli:main"
 km = "agent_tty.monitor:main"
+
+[tool.hatch.build.targets.wheel.shared-data]
+"man/agent-tty.1" = "share/man/man1/agent-tty.1"

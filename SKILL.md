@@ -6,7 +6,11 @@
 pip install agent-tty            # → k, km, agent-tty in PATH
 ```
 
-Requires POSIX, Python 3.8+, and tmux 3.0+. Or without pip: `./scripts/k` works immediately (dev shim, no install needed).
+If `k --version` is stale or PATH is shadowed, reinstall in the active environment:
+`python -m pip install --upgrade --force-reinstall agent-tty`, then run `k --version`,
+`km --version`, `agent-tty --version`, and `python -m agent_tty --version`.
+
+Requires POSIX, Python 3.10+, and tmux 3.0+. Or without pip: `./scripts/k` works immediately (dev shim, no install needed).
 
 ## When to use
 
@@ -34,61 +38,39 @@ Zero config for bash/python. `--prompt` for exact match or custom hook.
 k new    <session> [cmd...] [--prompt="x"]     spawn session (default: bash)
 k new    <session> <cmd> --prompt=./hook        hook mode
 k fire   [-t N] [session] <code>               async fire (default 300s)
-k poll   [session] [cell_id]                   poll result (O(1))
+k poll   [session] [cell_id]                   poll async result
 k run    [-j] [-t N] [session] <code>          sync (default 30s)
 k await  ...                                   alias for run
-k notify [session] <message>                   notification (direct to log)
-k int    [session]                             ctrl-c (+ re-frame in repeat mode)
+k notify [session] <message>                   notification event
+k int    [session]                             interrupt active cell
 k kill   <session>                             kill + cleanup
 k ls                                           list sessions
-k status [session]                             health check
+k status [session]                             health + next action
 k watch  [session]                             live filtered view
 k history [-n N] [session]                     last N×5 lines (default 5)
+k --version                                    print agent-tty version
+                                                aliases: k -V, k version
 ```
 
 Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
 
-## Architecture
-
-```
-k new   -> spawn tmux (width 10000) -> start pipe-pane
-k fire  -> acquire lock -> paste-buffer (code) + send-keys (frame enters) -> bg watcher
-k poll  -> check result file (O(1)) -> return output or "running"
-k run   -> acquire lock -> send code + run stream processor inline -> release
-```
+Use `k status <session>` when stuck. It repairs the log pipe if needed and prints the next useful command.
 
 **Frame detection** has three modes via `--prompt`:
 
 | --prompt= | mode | how it works |
 |-----------|------|-------------|
-| *(not set)* | repeat | 5 empty Enters → detect 5 identical lines |
+| *(not set)* | repeat | works for ordinary bash/python prompts |
 | `"string"` | exact | match prompt string exactly |
 | `./file` | hook | stdin lines → hook exit = frame end |
-
-**Stream processor**: state machine (ECHOING -> OUTPUT -> DONE). Tails the log in real-time. Classifies each line as it arrives. Writes result file when done.
-
-**Background watcher**: fire spawns a Python subprocess per cell in its own process group. It runs the stream processor, writes the result, and marks a done-lock as `completed`. poll reads the result file. O(1).
 
 ## Frame Detection
 
 ### Default: repeated prompt lines (zero config)
 
-```
-k sends: "echo hello" via paste-buffer + 5 empty Enters via send-keys
-log shows:
-  echo hello              <- echo (skipped by echo_count)
-  hello                   <- output (collected)
-  root@vm:/#              <- prompt 1 (from command)
-  root@vm:/#              <- prompt 2 (from Enter)
-  root@vm:/#              <- prompt 3 (from Enter)
-  root@vm:/#              <- prompt 4 (from Enter)
-  root@vm:/#              <- prompt 5 (from Enter)
-                           <- 5 identical = DONE
-```
+Works after `cd`, venv activation, prompt theme changes, and ordinary bash/python prompts.
 
-Works after cd, venv activation, prompt theme change.
-
-Bash multiline cells are special-cased: k writes the original code to a 0600 per-cell script and sends `source <script>` to the persistent shell. That keeps cd/env/functions in the same TTY while avoiding interleaved prompt echoes.
+Bash multiline cells preserve state: `cd`, exported env vars, shell functions, and aliases remain in the same persistent shell.
 
 ### Exact match: `--prompt="(gdb)"`
 
@@ -96,7 +78,7 @@ For REPLs where empty Enter has side effects (gdb repeats last command).
 
 ### Hook: `--prompt=./detect.py`
 
-k feeds ANSI-stripped lines to hook's stdin. Hook exits when frame ends. k pops the last line (= the boundary). Hook paths must include a path separator (`/`). The path is canonicalised to absolute at `k new` time; the hook file must exist and be executable (`chmod +x`).
+k feeds output lines to the hook's stdin. Hook exit means the frame is done. Hook paths must include a path separator (`/`). The path is canonicalised at `k new` time; the hook file must exist and be executable (`chmod +x`).
 
 ```python
 #!/usr/bin/env python3
@@ -108,7 +90,7 @@ while True:
         sys.exit(0)
 ```
 
-In hook mode, k does NOT filter `...` continuation prompts — the hook user takes full control of output.
+In hook mode, k does not filter `...` continuation prompts; the hook owns frame detection.
 
 ## Sync Mode
 
@@ -132,7 +114,7 @@ k poll work
 # {"cell_id":"a1b2c3d4e5f6","status":"done","output":"..."}
 ```
 
-poll is O(1): checks if the background watcher wrote a result file.
+Use `k poll` for quick async checks. For long-running work, prefer `km -1` so the agent is woken on completion instead of polling.
 
 ## Timeout
 
@@ -148,7 +130,7 @@ k poll work                    # → {"status": "error", "output": "interrupted"
 
 ## ctrl-c
 
-`k int` sends SIGINT, kills any bg watcher, writes an `error`/`interrupted` result for the old cell, and releases the lock. In repeat mode (no `--prompt`), it also re-sends frame enters because SIGINT clears readline's typeahead buffer. In prompt/hook mode, no extra Enters are sent (they could have side effects).
+`k int` interrupts the active cell, writes an `error`/`interrupted` result for it, and releases the session so new commands can run.
 
 ## JSON Schema
 
@@ -162,41 +144,18 @@ error:        {"status": "error", "output": "..."}
 cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
-Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
-Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
-
-## Safety Invariants
-
-- One cell per session (O_EXCL lock). Second fire/run refused.
-- Lock acquired BEFORE send — rejected fire/run never touches the REPL.
-- Timeout keeps lock — prevents new commands from mixing with a potentially still-running REPL command. Only `k int` or `k kill` releases.
-- Completed done-locks are recoverable. If the agent never polls, the next fire/run can clear the done-lock while preserving the result file for explicit `k poll <cell_id>`.
-- Lock stores the bg watcher process group. poll detects orphaned watchers (crash/OOM) via `os.killpg(pgid, 0)` (POSIX).
-- Code sent via per-session named paste-buffer (no cross-session collision).
-- tmux width 10000: prevents line wrapping that would skew echo_count.
-- Session names validated: `[A-Za-z0-9_.-]+`, no path traversal.
-- Pipe-pane restarted on every fire/run (idempotent, recovers dead pipes).
-- Result files written atomically (tmp + fsync + `os.replace`). poll never reads partial JSON.
-- k does not classify output. "done" = prompt appeared, not "command succeeded".
-
-## Metadata on Disk
-
-```
-$XDG_RUNTIME_DIR/k_cells/<session>/    (or /tmp/k_cells_<uid>/<session>/)
-  _session.json       {name} or {name, prompt}
-  _lock.json          {cell_id, log_offset, echo_count, bg_pgid, completed?, timed_out?, terminal_status?}
-  _output.log         pipe-pane stream (append-only)
-  <cell_id>_result.json  stream processor output (deleted after poll)
-```
+JSON errors without `cell_id`: `no session 'x'; use k new x bash`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`, `invalid cell_id`.
+JSON errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `result missing`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
+Text-only errors: `no session found; use k ls or k new <session> bash`, `no log for 'x'; use k status x`, `watcher kill failed; use k kill`.
 
 ## Known Limitations
 
 agent-tty is POSIX-only. It requires tmux, tail, and POSIX process signals.
 WSL is fine; native Windows fails fast.
 
-**Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
+**Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, k may falsely detect completion. Extremely rare — 5 identical lines = zero information entropy.
 
-**echo_count heuristic**: generic REPL mode assumes 1 sent line = 1 echoed line. Bash multiline cells avoid this by sourcing a private per-cell script; other REPLs still rely on prompt filtering or hook/exact prompt mode.
+**Echoed input**: some unusual REPLs echo pasted input differently. If output framing looks wrong, use exact prompt mode or hook mode.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
@@ -232,9 +191,9 @@ k new remote "ssh prod"                        # zero config
 
 ## km — event monitor
 
-Callback-style completion for persistent TTY cells. Tails the session log via pipe-pane. Each stdout line is one JSON event.
+Callback-style completion for persistent TTY cells. Each stdout line is one JSON event.
 
-Designed for **Claude Code's Monitor tool** — each stdout line becomes an agent interrupt. Other frameworks can spawn `km` as a subprocess and read stdout.
+Each stdout line is a JSON event. Any host with background-notification support (Claude Code's Monitor tool, Codex's `notify` callback, or a plain subprocess reader) can consume them directly.
 
 ```
 km <session> [cell_id] [-1]
@@ -252,7 +211,7 @@ k is the stateful terminal. km is the callback channel for long-running cells. B
 
 # km: one tool call, block until done
 km work -1
-# {"cell_id": "...", "status": "done", "ts": "..."}
+# {"cell_id": "...", "session": "work", "status": "done", "ts": "..."}
 ```
 
 Use `km -1` when the task takes longer than a few seconds — fire, start monitor, get interrupted on completion. Use `k poll` for quick checks, shell scripts, or agent frameworks without a monitor/interrupt path.
@@ -271,15 +230,4 @@ interrupted: {"cell_id": "...", "session": "...", "status": "interrupted", "ts":
 notify:      {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
 closed:      {"session": "...", "status": "closed", "ts": "..."}
 error:       {"session": "...", "status": "error",  "message": "...", "ts": "..."}
-```
-
-## Testing
-
-```bash
-python tests/test_contracts.py      # static code contracts, no tmux
-python tests/test_docs.py           # README/SKILL drift, no tmux
-bash tests/test.sh                  # 34 tests (32 without gdb), runtime smoke suite
-python tests/test_regressions.py    # targeted audit regressions
-python tests/run_all.py             # all suites
-bash tests/test.sh ./scripts/k       # custom k path
 ```

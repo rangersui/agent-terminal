@@ -57,6 +57,10 @@ jobs:
           python -m agent_tty --help >/dev/null
           k --help >/dev/null
           km --help >/dev/null
+          python -m agent_tty --version
+          k --version
+          km --version
+          agent-tty --version
           python -c "import agent_tty; print(agent_tty.__version__)"
 
   runtime:

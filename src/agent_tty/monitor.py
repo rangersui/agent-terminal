@@ -8,6 +8,7 @@ Each stdout line -> one Monitor notification -> agent interrupt.
 
 Usage:
   km <session> [cell_id] [-1]
+  km --version
 
   session    tmux session to watch
   cell_id    only match this cell (optional, matches any cell if omitted)
@@ -26,7 +27,6 @@ Architecture:
 
 import sys
 import os
-import re
 import json
 import shlex
 import signal
@@ -34,11 +34,23 @@ import subprocess
 
 from datetime import datetime, timezone
 
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
+from agent_tty import __version__  # noqa: E402
+
+_VERSION_ARGS = ("--version", "-V", "version")
+if len(sys.argv) >= 2 and sys.argv[1] in _VERSION_ARGS:
+    print(f"agent-tty {__version__}")
+    sys.exit(0)
+
 from agent_tty._shared import (
-    TMUX, ANSI_RE, CELL_DIR,
+    TMUX, TAIL, ANSI_RE, CELL_DIR,
     FIRED, DONE, CLOSED, ERROR, NOTIFY,
     CELL_START_RE, CELL_END_RE, NOTIFY_EVENT_RE,
-    ensure_private_dir, validate_name,
+    CELL_ID_RE,
+    ensure_private_dir, open_private, validate_cell_id, validate_name,
 )
 
 
@@ -74,18 +86,8 @@ class E:
 
 
 def session_log_path(session: str) -> str:
+    validate_name(session, prefix="km:")
     return os.path.join(ensure_private_dir(os.path.join(CELL_DIR, session)), "_output.log")
-
-def open_private(path: str, flags: int, mode: str):
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        return os.fdopen(fd, mode)
-    except Exception:
-        os.close(fd)
-        raise
 
 
 def start_pipe(session: str) -> str:
@@ -111,7 +113,7 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
     # verify session
     r = subprocess.run([TMUX, "has-session", "-t", session], capture_output=True)
     if r.returncode != 0:
-        E.error(session, f"no session '{session}'")
+        E.error(session, f"no session '{session}'; use k new {session} bash")
         return 1
 
     logfile = start_pipe(session)
@@ -127,37 +129,55 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
     signal.signal(signal.SIGINT, request_stop)
 
     try:
-        # Pre-scan: if awaiting a specific cell, check if it already completed.
-        # Prevents km -1 from hanging when the cell finished before km started.
-        scan_offset = 0
-        if cell_id and oneshot:
+        # Pre-scan: one-shot must notice completions that happened before km
+        # started. With no cell_id, return the latest fired cell that completed.
+        scan_offset = None
+        if oneshot:
+            seen_fired = set()
+            last_completion = None
             try:
-                with open(logfile, "rb") as f:
+                with open_private(logfile, os.O_RDONLY, "rb") as f:
                     for raw_line in f:
                         line = ANSI_RE.sub("", raw_line.decode("utf-8", errors="replace")).strip()
                         if not line:
                             continue
+                        m = CELL_START_RE.match(line)
+                        if m:
+                            cid = m.group(1)
+                            if cell_id is None or cid == cell_id:
+                                seen_fired.add(cid)
+                            continue
                         m = CELL_END_RE.match(line)
-                        if m and m.group(1) == cell_id:
-                            E.completed(cell_id, session, m.group(2))
-                            return 0
+                        if m:
+                            cid, status = m.group(1), m.group(2)
+                            if cell_id is not None and cid == cell_id:
+                                E.completed(cell_id, session, status)
+                                return 0
+                            if cell_id is None and cid in seen_fired:
+                                last_completion = (cid, status)
+                                seen_fired.discard(cid)
                     scan_offset = f.tell()
+                if cell_id is None and last_completion:
+                    cid, status = last_completion
+                    E.completed(cid, session, status)
+                    return 0
             except OSError:
-                pass
+                scan_offset = 0
 
         # tail -f: interrupt-driven (inotify on linux, kqueue on mac)
         # If pre-scanned, start from scan position to cover the race window;
         # otherwise start from EOF (only new events).
-        if scan_offset > 0:
-            tail_cmd = ["tail", "-c", f"+{scan_offset + 1}", "-f", logfile]
+        if scan_offset is not None:
+            tail_cmd = [TAIL, "-c", f"+{scan_offset + 1}", "-f", logfile]
         else:
-            tail_cmd = ["tail", "-n", "0", "-f", logfile]
+            tail_cmd = [TAIL, "-n", "0", "-f", logfile]
 
         tail_proc = subprocess.Popen(
             tail_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            errors="replace",
             bufsize=1,
         )
 
@@ -216,8 +236,8 @@ def main():
     for arg in args[1:]:
         if arg == "-1":
             oneshot = True
-        elif re.match(r"^[0-9a-f]{12}$", arg):
-            cell_id = arg
+        elif CELL_ID_RE.match(arg):
+            cell_id = validate_cell_id(arg)
         else:
             print(f"unknown arg: {arg}", file=sys.stderr)
             return 1

@@ -129,7 +129,8 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
     <code id="install-cmd">pip install agent-tty</code>
     <button class="copy-btn" aria-live="polite" onclick="navigator.clipboard.writeText('pip install agent-tty').then(()=>{this.textContent='copied!';setTimeout(()=>this.textContent='copy',1500)})" title="Copy">copy</button>
   </div>
-  <p class="requires">Requires Python 3.8+ and tmux 3.0+</p>
+  <p class="requires">Refresh stale entrypoints with <code>python -m pip install --upgrade --force-reinstall agent-tty</code>, then check <code>k --version</code>, <code>km --version</code>, <code>agent-tty --version</code>, and <code>python -m agent_tty --version</code>.</p>
+  <p class="requires">Requires POSIX, Python 3.10+, and tmux 3.0+. Linux, macOS, and WSL are supported; native Windows fails fast.</p>
 </section>
 
 <!-- terminal demo -->
@@ -176,7 +177,7 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
 <span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
 
 <span class="prompt">$ </span><span class="cmd">km work a1b2c3d4e5f6 -1</span>
-<span class="output">{<span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"ts"</span>: <span class="json-val">"..."</span>}</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"session"</span>: <span class="json-val">"work"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"ts"</span>: <span class="json-val">"..."</span>}</span>
       </div>
     </div>
     <div class="terminal compact">
@@ -242,38 +243,37 @@ $ export FIX_READY=1
     <div class="feature">
       <div class="icon">&#x1F6E1;&#xFE0F;</div>
       <h3>Safe recovery</h3>
-      <p>One cell at a time, timeout locks, <code>k int</code> Ctrl-C, and atomic result writes keep sessions recoverable.</p>
+      <p>One cell at a time, timeout recovery hints, <code>k status</code> next actions, and <code>k int</code> Ctrl-C keep sessions recoverable.</p>
     </div>
   </div>
 </section>
 
 <!-- how it works -->
 <section class="how">
-  <h2>How it works</h2>
-  <div class="flow"><span class="highlight">k fire</span> "echo hello"
-  |
-  +-- acquires lock (<span class="highlight">O_EXCL</span>, rejected = zero side effects)
-  +-- sends code via <span class="highlight">paste-buffer</span> (atomic)
-      bash multiline -> 0600 temp script + <span class="highlight">source</span>
-  +-- sends 5 frame enters (repeat mode only)
-  +-- starts background <span class="highlight">stream processor</span>
-  |
-  stream processor tails log:
-    ECHOING: skip echo_count lines
-    OUTPUT:  collect lines
-    DONE:    5 identical lines / prompt match / hook exit
-  |
-  writes result file (<span class="highlight">fsync + os.replace</span>) -> exits
-  |
-<span class="highlight">k poll</span>
-  +-- checks result file (<span class="highlight">O(1)</span>)
-  +-- returns JSON
+  <h2>Operator loop</h2>
+  <div class="flow"><span class="highlight">k new</span> work bash
+  +-- create one persistent TTY
+  +-- cwd, env, imports, sockets, ssh, debuggers stay alive
 
-<span class="highlight">k run</span> "echo hello"
-  |
-  +-- acquires lock -> sends code -> runs stream processor <span class="highlight">inline</span>
-  +-- blocks until done or timeout
-  +-- returns JSON directly (no poll needed)</div>
+<span class="highlight">k run -j</span> work "echo hello"
+  +-- short cell
+  +-- returns JSON directly
+
+<span class="highlight">k fire</span> work "pytest -q && tail -20 logs/server.log"
+  +-- long cell
+  +-- returns a cell_id immediately
+
+<span class="highlight">km work &lt;cell_id&gt; -1</span>
+  +-- wait once
+  +-- wake the agent when the cell finishes
+
+<span class="highlight">k status</span> work
+  +-- repair the log pipe if needed
+  +-- print the next useful command
+
+<span class="highlight">k watch</span> work        filtered human view
+<span class="highlight">tmux attach -t work</span> raw human takeover
+<span class="highlight">k int</span> work          interrupt without losing the session</div>
 </section>
 
 <!-- km monitor -->

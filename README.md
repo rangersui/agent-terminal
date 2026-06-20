@@ -38,10 +38,22 @@ k run -j py "print(42)"
 
 ## Install
 
-Requires: **POSIX**, **Python 3.8+**, **tmux 3.0+**
+Requires: **POSIX**, **Python 3.10+**, **tmux 3.0+**
 
 ```bash
 pip install agent-tty            # → k, km, agent-tty in PATH
+```
+
+To refresh a stale `k`/`km` entry point, reinstall in the same shell environment
+that will run it, then verify the resolved command:
+
+```bash
+python -m pip install --upgrade --force-reinstall agent-tty
+k --version
+km --version
+agent-tty --version
+python -m agent_tty --version
+command -v k    # use: where.exe k  (PowerShell)
 ```
 
 Or without pip:
@@ -71,12 +83,20 @@ k notify [session] <message>                   notification (direct to log)
 k int    [session]                             ctrl-c (+ re-frame in repeat mode)
 k kill   <session>                             kill + cleanup
 k ls                                           list sessions
-k status [session]                             health check
+k status [session]                             health + next action
 k watch  [session]                             live filtered view
 k history [-n N] [session]                     last N×5 lines (default 5)
+k --version                                    print agent-tty version
+                                                aliases: k -V, k version
 ```
 
 Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
+
+`k status work` repairs the log pipe if needed and prints the next useful command:
+
+```bash
+OK work pipe=ok state=running cell=a1b2c3d4e5f6 next='k poll work a1b2c3d4e5f6 or k int work'
+```
 
 ## Frame Detection
 
@@ -142,15 +162,16 @@ error:        {"status": "error", "output": "..."}
 cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
-Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
-Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
+JSON errors without `cell_id`: `no session 'x'; use k new x bash`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`, `invalid cell_id`.
+JSON errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `result missing`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
+Text-only errors: `no session found; use k ls or k new <session> bash`, `no log for 'x'; use k status x`, `watcher kill failed; use k kill`.
 
 ## Metadata on Disk
 
 ```
 $XDG_RUNTIME_DIR/k_cells/<session>/    (or /tmp/k_cells_<uid>/<session>/)
   _session.json       {name} or {name, prompt}
-  _lock.json          {cell_id, log_offset, echo_count, bg_pgid, completed?, timed_out?, terminal_status?}
+  _lock.json          {cell_id, log_offset, echo_count, bg_pgid, completed?, timed_out?, timeout_polled?, terminal_status?}
   _output.log         pipe-pane stream (append-only)
   <cell_id>_result.json  stream processor output (deleted after poll)
 ```
@@ -172,7 +193,7 @@ WSL is fine; native Windows fails fast.
 
 Callback-style completion for persistent TTY cells. `km` tails the session log via pipe-pane and emits one JSON line per event to stdout. No polling, no sleep loops.
 
-Currently designed for **Claude Code's Monitor tool**, which reads each stdout line as an agent interrupt. Other agent frameworks can achieve the same by spawning `km` as a subprocess and reading its stdout.
+Each stdout line is a JSON event. Works with any agent host that has background-notification support: Claude Code's Monitor tool reads each line as an interrupt, Codex Desktop can bridge via its `notify` callback, and plain subprocess readers work the same way.
 
 ```
 km <session> [cell_id] [-1]
@@ -194,7 +215,7 @@ waste tokens and add latency:
 
 # km: one tool call, block until done
 km work -1
-# {"cell_id": "...", "status": "done", "ts": "..."}
+# {"cell_id": "...", "session": "work", "status": "done", "ts": "..."}
 ```
 
 With `km -1`, the agent fires a long task, starts `km` as a background monitor, and gets interrupted exactly once when the task completes. Zero wasted calls.
@@ -219,8 +240,8 @@ error:       {"session": "...", "status": "error",  "message": "...", "ts": "...
 
 ```bash
 python tests/test_contracts.py      # static code contracts, no tmux
-python tests/test_docs.py           # README/SKILL drift, no tmux
-bash tests/test.sh                  # 34 tests (32 without gdb), runtime smoke suite
+python tests/test_docs.py           # docs/package drift, no tmux
+bash tests/test.sh                  # 66 tests (64 without gdb), runtime smoke suite
 python tests/test_regressions.py    # targeted audit regressions
 python tests/run_all.py             # all suites
 ```
@@ -232,6 +253,7 @@ src/agent_tty/cli.py       k — main script
 src/agent_tty/monitor.py   km — event monitor
 scripts/k, scripts/km      dev shims (no pip install needed)
 pyproject.toml             pip install agent-tty → agent-tty, k, km in PATH
+man/agent-tty.1            man page source
 tests/test.sh              runtime smoke suite
 tests/*.py                 static, docs, and regression suites
 SKILL.md                   agent reference
