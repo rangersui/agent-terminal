@@ -268,11 +268,12 @@ def _log_session(name: str, src: str, output: str = "", error: bool = False) -> 
 # -----------------------------------------------
 
 def _secure_path_win32(path: str) -> None:
-    """Set OWNER RIGHTS DACL on a Windows path intentionally.
+    """Restrict a Windows path to owner, SYSTEM, and Administrators.
 
-    This gives process-tree-level isolation: only the process that created
-    the path (and its children) can access it.  Other processes under the
-    same user account cannot.  This is stronger than Unix user-level isolation.
+    Strips inherited ACLs and grants full control only to OWNER RIGHTS,
+    SYSTEM, and BUILTIN\\Administrators.  This is owner-level isolation
+    (comparable to Unix chmod 700), NOT process-tree isolation -- any
+    process running as the same user can still access the path.
 
     We do NOT rely on CPython's mode=0o700 DACL side effect (CVE-2024-4030);
     we set it explicitly via icacls so it works on any Python version.
