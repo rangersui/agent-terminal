@@ -680,6 +680,8 @@ def test_cert_generation():
             fp = pythond._cert_fingerprint(cert)
             check("fingerprint not unknown", fp != "unknown")
             check("fingerprint has colons", ":" in fp)
+            check("generated cert matches key",
+                  pythond._cert_key_pair_valid(cert, key))
             cert_obj = pythond.x509.load_pem_x509_certificate(
                 open(cert, "rb").read()
             )
@@ -697,6 +699,13 @@ def test_cert_generation():
             # second call returns cached
             cert2, key2 = pythond._generate_cert()
             check("cached same cert", cert2 == cert)
+            with open(key2, "wb") as f:
+                f.write(b"bad key")
+            with mock.patch.object(sys, "stderr", io.StringIO()):
+                cert3, key3 = pythond._generate_cert()
+            check("mismatched key regenerates",
+                  cert3 == cert and key3 == key and
+                  pythond._cert_key_pair_valid(cert3, key3))
 
 
 def test_cert_generation_no_crypto():
@@ -896,6 +905,9 @@ def test_tls_and_auth_hardening_static():
 def test_connection_hardening_static():
     section("connection hardening static")
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
+    check("future annotations prevent runtime type evaluation",
+          "from __future__ import annotations" in src and
+          src.index("from __future__ import annotations") < src.index("import sys"))
     attach_seg = src[src.index("def attach(name: str)"):src.index("def _attach_reader(")]
     attach_pty_seg = src[src.index("def _attach_ws_pty("):src.index("def _attach_ws_win(")]
     send_seg = src[src.index("def _send("):src.index("def client(")]
@@ -942,7 +954,7 @@ def test_connection_hardening_static():
           "                    select.select([], [sock], [], 1.0)" in src)
     check("zero-byte send does not spin",
           "if sent == 0:" in send_all_seg and
-          "select.select([], [sock], [], 1.0)" in send_all_seg)
+          "if sent == 0:\n                        return False" in send_all_seg)
     check("attach uses shared daemon connector", "_connect_daemon(" in attach_seg)
     check("attach no direct ws_connect", "ws_connect" not in attach_seg)
     check("attach closes websocket on handshake failure",
@@ -1027,6 +1039,9 @@ def test_connection_hardening_static():
     check("cert writes are atomic",
           "os.replace(tmp_key, key_path)" in cert_gen_seg and
           "os.replace(tmp_cert, cert_path)" in cert_gen_seg)
+    check("cert cache validates key pair",
+          "_cert_key_pair_valid(cert_path, key_path)" in cert_gen_seg and
+          "TLS cert/key mismatch; regenerating" in cert_gen_seg)
     check("cert partial replace is invalidated",
           "for fpath in (tmp_key, tmp_cert, key_path, cert_path):" in cert_gen_seg)
     check("self-signed cert is not a CA",
@@ -1036,7 +1051,8 @@ def test_connection_hardening_static():
     check("TLS bridge cleans inner server on bind failure",
           "self._inner.shutdown()" in tls_server_seg)
     check("TLS bridge has connection cap",
-          "_MAX_TLS_BRIDGE_THREADS" in tls_server_seg)
+          "len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS" in tls_server_seg and
+          "self._inner_thread" in tls_server_seg)
     check("new_session rolls back failed registration",
           "_close_session_resources(session)" in new_session_seg)
     check("set_session closes replaced session",
@@ -1059,6 +1075,9 @@ def test_connection_hardening_static():
           "lambda d: _write_all(master_fd, d)" in new_session_seg)
     check("kill closes PTY bridge",
           "bridge.close()" in close_session_seg)
+    check("close clears process handles",
+          "s[\"winpty\"] = None" in close_session_seg and
+          "s[\"proc\"] = None" in close_session_seg)
     check("fork monitor always marks done",
           "finally:\n                r[\"status\"] = \"done\"" in fork_monitor_seg)
     check("fork monitor clears pid immediately after waitpid",
@@ -1102,6 +1121,10 @@ def test_connection_hardening_static():
     check("monitor closes resources under session lock",
           "with _session_lock(s):" in monitor_seg and
           "_close_session_resources(s)" in monitor_seg)
+    check("monitor skips cleared handles",
+          "winpty = s.get(\"winpty\")" in monitor_seg and
+          "proc = s.get(\"proc\")" in monitor_seg and
+          "s[\"proc\"].wait()" not in monitor_seg)
     check("session command path avoids timeout-sensitive makefile",
           "makefile" not in send_session_seg and
           "_recv_session_line" in src)
@@ -1163,8 +1186,9 @@ def test_connection_hardening_static():
           "t.join(timeout=3)" in attach_loop_seg and
           attach_loop_seg.index("t.join(timeout=3)") <
           attach_loop_seg.index("restore_terminal()"))
-    check("windows attach preserves processed input",
-          "old_in.value | _WIN_ENABLE_PROCESSED_INPUT" in attach_win_seg)
+    check("windows attach clears processed input",
+          "old_in.value & ~0x0007" in attach_win_seg and
+          "_WIN_ENABLE_PROCESSED_INPUT" not in attach_win_seg)
     check("windows attach requires TTY",
           "sys.stdin.isatty()" in attach_win_seg and
           "attach requires a TTY" in attach_win_seg)
@@ -1172,7 +1196,7 @@ def test_connection_hardening_static():
           "first in (b\"\\x00\", b\"\\xe0\")" in attach_win_seg and
           "return first + msvcrt.getch()" in attach_win_seg)
     check("windows attach clears line and echo input",
-          "& ~0x0006" in attach_win_seg)
+          "& ~0x0007" in attach_win_seg)
     check("client prints ERR to stderr",
           "if resp and resp.startswith(\"ERR \") and fail_on_err:" in client_seg and
           "resp.startswith(\"ERR \")" in client_seg and

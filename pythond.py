@@ -113,6 +113,8 @@ fire vs fork:
     Forking after native thread runtimes are initialized (CUDA, OpenMP, BLAS)
     is risky; use fork early or kill/recreate the session if it wedges.
 """
+from __future__ import annotations
+
 import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile, code
 import argparse
 import select
@@ -146,7 +148,6 @@ _BUFFER_CHUNK = 64 * 1024
 _WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _ASYNC_CELL_TTL = 300
 _ATTACH_READ_SIZE = 1024
-_WIN_ENABLE_PROCESSED_INPUT = 0x0001
 _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 _WIN_ENABLE_PROCESSED_OUTPUT = 0x0001
 _WIN_ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
@@ -570,7 +571,12 @@ def _generate_cert() -> tuple[str, str]:
     if (os.path.exists(cert_path) and os.path.exists(key_path)
             and os.path.getsize(cert_path) > 0
             and os.path.getsize(key_path) > 0):
-        return cert_path, key_path
+        if _cert_key_pair_valid(cert_path, key_path):
+            return cert_path, key_path
+        print("WARN: TLS cert/key mismatch; regenerating", file=sys.stderr)
+        for fpath in (cert_path, key_path):
+            with contextlib.suppress(OSError):
+                os.unlink(fpath)
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
@@ -654,6 +660,19 @@ def _generate_cert() -> tuple[str, str]:
         raise
 
     return cert_path, key_path
+
+def _cert_key_pair_valid(cert_path: str, key_path: str) -> bool:
+    """Return whether an existing cert.pem matches key.pem."""
+    try:
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        with open(key_path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        cert_public = typing.cast(typing.Any, cert.public_key())
+        key_public = typing.cast(typing.Any, key.public_key())
+        return cert_public.public_numbers() == key_public.public_numbers()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
 
 def _cert_fingerprint(cert_path: str) -> str:
     """Return SHA-256 fingerprint of cert for pinning."""
@@ -740,15 +759,16 @@ class _TlsTerminatedServer:
             self._inner_port = inner_addr[1]
             self._sock = socket.create_server((host, port))
             self._sock.settimeout(1.0)
-            self._threads: list[threading.Thread] = []
+            self._bridge_threads: list[threading.Thread] = []
+            self._inner_thread: threading.Thread | None = None
         except Exception:
             self._inner.shutdown()
             raise
 
     def serve_forever(self) -> None:
-        t = threading.Thread(target=self._inner.serve_forever, daemon=True)
-        t.start()
-        self._threads.append(t)
+        self._inner_thread = threading.Thread(target=self._inner.serve_forever,
+                                              daemon=True)
+        self._inner_thread.start()
         while not self._stopped.is_set():
             self._reap_threads()
             try:
@@ -757,17 +777,19 @@ class _TlsTerminatedServer:
                 continue
             except OSError:
                 break
-            if len(self._threads) >= _MAX_TLS_BRIDGE_THREADS:
+            if len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS:
                 raw.close()
                 continue
             worker = threading.Thread(target=self._handle, args=(raw,),
                                       daemon=True)
             worker.start()
-            self._threads.append(worker)
+            self._bridge_threads.append(worker)
 
     def _reap_threads(self) -> None:
         """Drop finished bridge threads so accepted connections do not leak."""
-        self._threads = [t for t in self._threads if t.is_alive()]
+        self._bridge_threads = [
+            t for t in self._bridge_threads if t.is_alive()
+        ]
 
     def shutdown(self) -> None:
         self._stopped.set()
@@ -835,7 +857,6 @@ class _TlsTerminatedServer:
                 try:
                     sent = sock.send(view)
                     if sent == 0:
-                        select.select([], [sock], [], 1.0)
                         return False
                     view = view[sent:]
                 except _ssl.SSLWantReadError:
@@ -1700,54 +1721,66 @@ def _close_session_resources(s: JsonDict) -> bool:
                 ws.close()
             except Exception:
                 pass  # cleanup must not raise -- resources may already be dead
+            s["_ws"] = None
         return True
     if s["type"] == "pty":
         bridge = s.get("bridge")
         if bridge is not None:
             bridge.close()
-        if "winpty" in s:
+            s["bridge"] = None
+        winpty = s.get("winpty")
+        if winpty is not None:
             try:
-                if s["winpty"].isalive():
-                    s["winpty"].terminate(force=True)
+                if winpty.isalive():
+                    winpty.terminate(force=True)
             except Exception:
                 pass  # cleanup must not raise -- resources may already be dead
+            s["winpty"] = None
         else:
             # Kill entire process group (worker + any fork children).
             # Worker called os.setsid(), so its pgid == its pid.
+            proc = s.get("proc")
             try:
-                pgid = os.getpgid(s["proc"].pid)  # type: ignore[attr-defined]
+                pgid = (
+                    os.getpgid(proc.pid)  # type: ignore[attr-defined]
+                    if proc is not None else None
+                )
             except OSError:
                 pgid = None
-            if pgid is not None:
+            if proc is not None and pgid is not None:
                 try:
                     os.killpg(pgid, signal.SIGTERM)  # type: ignore[attr-defined]
-                    s["proc"].wait(timeout=3)
+                    proc.wait(timeout=3)
                 except (OSError, subprocess.TimeoutExpired):
                     try:
                         os.killpg(pgid, signal.SIGKILL)  # type: ignore[attr-defined]
-                        s["proc"].wait(timeout=1)
+                        proc.wait(timeout=1)
                     except Exception:
                         pass  # cleanup must not raise
-            else:
+                s["proc"] = None
+            elif proc is not None:
                 try:
-                    s["proc"].terminate()
-                    s["proc"].wait(timeout=3)
+                    proc.terminate()
+                    proc.wait(timeout=3)
                 except (OSError, subprocess.TimeoutExpired):
                     try:
-                        s["proc"].kill()
-                        s["proc"].wait(timeout=1)
+                        proc.kill()
+                        proc.wait(timeout=1)
                     except Exception:
                         pass  # cleanup must not raise
+                s["proc"] = None
         if s.get("master_fd") is not None:
             try:
                 os.close(s["master_fd"])
             except OSError:
                 pass  # cleanup must not raise -- resources may already be dead
+            s["master_fd"] = None
         for resource in ("ai",):
             try:
                 handle = s.get(resource)
                 if handle is not None:
                     handle.close()
+                    s[resource] = None
             except OSError:
                 pass  # cleanup must not raise -- resources may already be dead
         for resource in ("ai_rf", "ai_wf"):
@@ -1755,6 +1788,7 @@ def _close_session_resources(s: JsonDict) -> bool:
                 handle = s.get(resource)
                 if handle is not None:
                     handle.close()
+                    s[resource] = None
             except OSError:
                 pass  # cleanup must not raise -- resources may already be dead
     return True
@@ -1766,10 +1800,12 @@ def _monitor_session(name: str) -> None:
         return
     try:
         if s["type"] == "pty":
-            if "winpty" in s:
-                s["winpty"].wait()
-            elif "proc" in s:
-                s["proc"].wait()
+            winpty = s.get("winpty")
+            proc = s.get("proc")
+            if winpty is not None:
+                winpty.wait()
+            elif proc is not None:
+                proc.wait()
     except Exception as e:
         print(f"WARN: session {name} exited abnormally: {e}",
               file=sys.stderr)
@@ -2958,8 +2994,7 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
     kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out))
     kernel32.SetConsoleMode(
         stdin_h,
-        (old_in.value | _WIN_ENABLE_PROCESSED_INPUT |
-         _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT) & ~0x0006,
+        (old_in.value & ~0x0007) | _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT,
     )
     kernel32.SetConsoleMode(
         stdout_h,
