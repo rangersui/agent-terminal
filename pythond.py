@@ -140,6 +140,41 @@ __version__ = "0.3.0"
 JsonDict = dict[str, typing.Any]
 WebSocketLike = typing.Any
 SocketLike = typing.Any
+SessionType = typing.Literal["pty", "remote"]
+
+class SessionOptionalDict(typing.TypedDict, total=False):
+    """Optional runtime session fields.
+
+    Sessions stay plain dicts.  This is only for static checking and IDE
+    completion; these keys are created lazily by existing code.
+    """
+    proc: typing.Any
+    winpty: typing.Any
+    master_fd: int | None
+    bridge: typing.Any
+    ai: socket.socket | None
+    ai_rf: typing.Any
+    ai_wf: typing.Any
+    _lock: typing.Any
+    _close_lock: typing.Any
+    _closed: bool
+    _unhealthy: bool
+    _async_src: dict[str, str]
+    _ai_buf: bytes
+    _ws: WebSocketLike | None
+
+class PtySessionDict(SessionOptionalDict):
+    type: typing.Literal["pty"]
+
+class RemoteSessionDict(SessionOptionalDict):
+    type: typing.Literal["remote"]
+    alias: str
+    host: str
+    port: int
+    token: str
+    tls: bool
+
+SessionDict = PtySessionDict | RemoteSessionDict
 
 def _protocol_version(version: str) -> str:
     """Return the WebSocket protocol version as major.minor."""
@@ -1702,10 +1737,21 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
 # DAEMON -- socket + process manager
 # =============================================
 
-sessions: dict[str, JsonDict] = {}
+# Lock discipline for daemon/session state:
+#   - _session_lock_guard is only a short factory mutex for per-session locks.
+#     It must not guard user/session work and should be released immediately.
+#   - _sessions_lock protects only the global sessions map. Hold it briefly
+#     for lookup, publish, identity checks, and pop.
+#   - per-session _lock serializes commands for one session. Code may hold it
+#     while briefly taking _sessions_lock to verify/remove that same session.
+#   - per-session _close_lock makes cleanup idempotent after removal. Cleanup
+#     may run while _lock is held; it must not reacquire _sessions_lock.
+#   - Worker async cancellation has its own order inside each worker process:
+#     _INTERRUPT_LOCK -> _cells_lock.
+sessions: dict[str, SessionDict] = {}
 _sessions_lock = threading.Lock()
 _session_lock_guard = threading.Lock()
-_daemon_token = None
+_daemon_token: str | None = None
 _daemon_server: _Servable | None = None
 
 def _session_lock(session: JsonDict) -> threading.Lock:
@@ -1729,18 +1775,18 @@ def _session_close_lock(session: JsonDict) -> threading.Lock:
 def _get_session(name: str) -> JsonDict | None:
     """Return a session object by name, or None if absent."""
     with _sessions_lock:
-        return sessions.get(name)
+        return typing.cast(JsonDict | None, sessions.get(name))
 
 def _set_session(name: str, session: JsonDict) -> None:
     """Publish a newly created session atomically."""
     _validate_session_name(name)
-    old_session = None
+    old_session: SessionDict | None = None
     with _sessions_lock:
         _check_session_capacity_locked(name)
         old_session = sessions.get(name)
-        sessions[name] = session
+        sessions[name] = typing.cast(SessionDict, session)
     if old_session is not None and old_session is not session:
-        _close_session_resources(old_session)
+        _close_session_resources(typing.cast(JsonDict, old_session))
 
 def _ensure_session_capacity(name: str) -> None:
     """Fail before allocating worker resources when no new session slot exists."""
@@ -1756,7 +1802,7 @@ def _check_session_capacity_locked(name: str) -> None:
 def _session_snapshot() -> list[tuple[str, JsonDict]]:
     """Return a stable list of (name, session) pairs."""
     with _sessions_lock:
-        return list(sessions.items())
+        return typing.cast(list[tuple[str, JsonDict]], list(sessions.items()))
 
 class PtyBridge:
     """Bridge: PTY <-> WebSocket binary frames.
@@ -1969,14 +2015,14 @@ def new_session(name: str) -> None:
             with contextlib.suppress(Exception):
                 proc.terminate(force=True)
             raise
-        session = {
+        winpty_session: PtySessionDict = {
             "type": "pty", "winpty": proc,
             "ai": ai_conn, "bridge": bridge,
         }
         try:
-            _set_session(name, session)
+            _set_session(name, typing.cast(JsonDict, winpty_session))
         except Exception:
-            _close_session_resources(session)
+            _close_session_resources(typing.cast(JsonDict, winpty_session))
             raise
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
@@ -2022,14 +2068,14 @@ def new_session(name: str) -> None:
             with contextlib.suppress(Exception):
                 p.terminate()
             raise
-        session = {
+        pty_session: PtySessionDict = {
             "type": "pty", "proc": p, "master_fd": master_fd,
             "ai": ai_parent, "bridge": bridge,
         }
         try:
-            _set_session(name, session)
+            _set_session(name, typing.cast(JsonDict, pty_session))
         except Exception:
-            _close_session_resources(session)
+            _close_session_resources(typing.cast(JsonDict, pty_session))
             raise
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
@@ -2039,48 +2085,50 @@ def new_session(name: str) -> None:
 def kill_session(name: str) -> bool:
     """Terminate one named session and close all daemon-owned resources."""
     with _sessions_lock:
-        s = sessions.get(name)
+        s = typing.cast(JsonDict | None, sessions.get(name))
     if s is None:
         return False
-    lock = _session_lock(s)
+    s_live = typing.cast(JsonDict, s)
+    lock = _session_lock(s_live)
     locked = lock.acquire(timeout=3)
     if not locked:
         should_close = False
         with _sessions_lock:
-            if sessions.get(name) is s:
+            if sessions.get(name) is s_live:
                 sessions.pop(name, None)
                 should_close = True
         if should_close:
-            return _close_session_resources(s)
+            return _close_session_resources(typing.cast(JsonDict, s_live))
         return False
     try:
         with _sessions_lock:
-            if sessions.get(name) is not s:
+            if sessions.get(name) is not s_live:
                 return False
             sessions.pop(name, None)
-        return _close_session_resources(s)
+        return _close_session_resources(typing.cast(JsonDict, s_live))
     finally:
         lock.release()
 
 def kill_session_if_current(name: str, expected: JsonDict) -> bool:
     """Kill name only if it still points at expected session object."""
-    lock = _session_lock(expected)
+    expected_live = typing.cast(JsonDict, expected)
+    lock = _session_lock(expected_live)
     locked = lock.acquire(timeout=3)
     if not locked:
         should_close = False
         with _sessions_lock:
-            if sessions.get(name) is expected:
+            if sessions.get(name) is expected_live:
                 sessions.pop(name, None)
                 should_close = True
         if should_close:
-            return _close_session_resources(expected)
+            return _close_session_resources(expected_live)
         return False
     try:
         with _sessions_lock:
-            if sessions.get(name) is not expected:
+            if sessions.get(name) is not expected_live:
                 return False
             sessions.pop(name, None)
-        return _close_session_resources(expected)
+        return _close_session_resources(typing.cast(JsonDict, expected_live))
     finally:
         lock.release()
 
@@ -2179,10 +2227,11 @@ def _monitor_session(name: str) -> None:
     s = _get_session(name)
     if not s:
         return
+    s_live = typing.cast(JsonDict, s)
     try:
-        if s["type"] == "pty":
-            winpty = s.get("winpty")
-            proc = s.get("proc")
+        if s_live["type"] == "pty":
+            winpty = s_live.get("winpty")
+            proc = s_live.get("proc")
             if winpty is not None:
                 winpty.wait()
             elif proc is not None:
@@ -2190,12 +2239,12 @@ def _monitor_session(name: str) -> None:
     except Exception as e:
         print(f"WARN: session {name} exited abnormally: {e}",
               file=sys.stderr)
-    with _session_lock(s):
+    with _session_lock(s_live):
         with _sessions_lock:
-            if sessions.get(name) is not s:
+            if sessions.get(name) is not s_live:
                 return
             sessions.pop(name, None)
-        _close_session_resources(s)
+        _close_session_resources(typing.cast(JsonDict, s_live))
 
 def _recv_session_line(s: JsonDict) -> str | None:
     """Read one newline-delimited JSON response from the worker socket."""
@@ -2217,8 +2266,7 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
     """Send one AI command to a session and wait for its response.
 
     A per-session lock serializes concurrent callers (multiple WebSocket
-    handlers hitting the same session).  Remote sessions already had this
-    via _send_remote's lock; local sessions now get the same protection.
+    handlers hitting the same session), for both local and remote sessions.
     """
     s = _get_session(name)
     if s is None:
@@ -2652,12 +2700,13 @@ def connect_remote(
             except Exception:
                 pass
     try:
-        _set_session(name, {
+        session: RemoteSessionDict = {
             "type": "remote",
             "alias": name,
             "host": host, "port": port, "token": token,
             "tls": use_tls,
-        })
+        }
+        _set_session(name, typing.cast(JsonDict, session))
     except RuntimeError as e:
         return f"ERR {_public_error(e)}"
     return f"OK connected {name} -> {host}:{port}{' tls' if use_tls else ''}"

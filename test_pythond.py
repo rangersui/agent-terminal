@@ -1689,13 +1689,14 @@ def test_connection_hardening_static():
           "len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS" in tls_server_seg and
           "self._inner_thread" in tls_server_seg)
     check("new_session rolls back failed registration",
-          "_close_session_resources(session)" in new_session_seg)
+          "_close_session_resources(typing.cast(JsonDict, winpty_session))" in new_session_seg and
+          "_close_session_resources(typing.cast(JsonDict, pty_session))" in new_session_seg)
     check("posix worker starts in own session before worker code",
           "start_new_session=True" in new_session_seg and
           "os.getsid(0) != os.getpid()" in worker_entry_seg)
     check("set_session closes replaced session",
           "old_session = sessions.get(name)" in set_session_seg and
-          "_close_session_resources(old_session)" in set_session_seg)
+          "_close_session_resources(typing.cast(JsonDict, old_session))" in set_session_seg)
     check("winpty accept failures terminate spawned worker",
           "except BaseException:" in new_session_seg and
           "proc.terminate(force=True)" in new_session_seg)
@@ -1774,14 +1775,14 @@ def test_connection_hardening_static():
     check("complete catches completer errors",
           "return {\"matches\": matches, \"_error\": True}" in dispatch_seg)
     check("stale monitor cannot kill replacement",
-          "sessions.get(name) is not s" in monitor_seg)
+          "sessions.get(name) is not s_live" in monitor_seg)
     check("monitor closes resources under session lock",
-          "with _session_lock(s):" in monitor_seg and
-          "_close_session_resources(s)" in monitor_seg)
+          "with _session_lock(s_live):" in monitor_seg and
+          "_close_session_resources(typing.cast(JsonDict, s_live))" in monitor_seg)
     check("monitor skips cleared handles",
-          "winpty = s.get(\"winpty\")" in monitor_seg and
-          "proc = s.get(\"proc\")" in monitor_seg and
-          "s[\"proc\"].wait()" not in monitor_seg)
+          "winpty = s_live.get(\"winpty\")" in monitor_seg and
+          "proc = s_live.get(\"proc\")" in monitor_seg and
+          "s_live[\"proc\"].wait()" not in monitor_seg)
     check("handle_new tolerates cleared process handles",
           "winpty = s.get(\"winpty\")" in handle_new_seg and
           "proc = s.get(\"proc\")" in handle_new_seg)
@@ -1807,7 +1808,7 @@ def test_connection_hardening_static():
     check("kill_session has lock timeout",
           "lock.acquire(timeout=3)" in kill_session_seg and
           "should_close = False" in kill_session_seg and
-          "if should_close:\n            return _close_session_resources(s)" in kill_session_seg)
+          "if should_close:\n            return _close_session_resources(typing.cast(JsonDict, s_live))" in kill_session_seg)
     check("close_session_resources is close-once guarded",
           "def _session_close_lock(" in src and
           "with _session_close_lock(s):" in close_session_seg and
