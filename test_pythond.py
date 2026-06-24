@@ -517,7 +517,10 @@ def test_cell_eviction():
 
 def test_session_name_sanitization():
     section("session name sanitization")
-    bad_names = ["../etc", "foo/bar", "a\\b", "x\0y", "", "..", ".../.../passwd"]
+    bad_names = [
+        "../etc", "foo/bar", "a\\b", "x\0y", "", ".", "..",
+        ".../.../passwd", "work.", "work ",
+    ]
     for name in bad_names:
         resp = pythond.handle_client("new", [name])
         check(f"reject '{name[:20]}'", "ERR" in resp, resp)
@@ -724,6 +727,37 @@ def test_raw_wss_payload_limit():
         check("oversize frame rejected", "too large" in str(e))
 
 
+def test_raw_wss_leftover_and_fragments():
+    section("RawWssClient leftovers and fragments")
+
+    def server_text(payload, fin=True, opcode=0x1):
+        first = (0x80 if fin else 0x00) | opcode
+        return bytes([first, len(payload)]) + payload
+
+    class FakeSock:
+        def __init__(self, data):
+            self.data = bytearray(data)
+            self.timeout = None
+        def recv(self, n):
+            if not self.data:
+                return b""
+            out = bytes(self.data[:n])
+            del self.data[:n]
+            return out
+        def gettimeout(self):
+            return self.timeout
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+    client = pythond._RawWssClient(FakeSock(b""))
+    client._recv_buf = server_text(b"ready")
+    check("leftover frame is read", client.recv(timeout=1) == "ready")
+
+    frag = server_text(b"he", fin=False, opcode=0x1) + server_text(b"llo", opcode=0x0)
+    client = pythond._RawWssClient(FakeSock(frag))
+    check("fragmented text assembled", client.recv(timeout=1) == "hello")
+
+
 def test_tls_and_auth_hardening_static():
     section("TLS/auth hardening")
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
@@ -740,16 +774,25 @@ def test_connection_hardening_static():
     section("connection hardening static")
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
     attach_seg = src[src.index("def attach(name: str)"):src.index("def _attach_reader(")]
+    attach_pty_seg = src[src.index("def _attach_ws_pty("):src.index("def _attach_ws_win(")]
     send_seg = src[src.index("def _send("):src.index("def client(")]
     handle_seg = src[src.index("def handle_client("):src.index("def daemon(")]
+    daemon_seg = src[src.index("def daemon("):src.index("    # --- start server ---")]
     runtime_seg = src[src.index("def _runtime_dir("):src.index("def _daemon_meta_path(")]
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
+    private_dir_seg = src[src.index("def _ensure_private_dir("):src.index("def _session_dir(")]
     cert_dirs_seg = src[src.index("def _trusted_clients_dir("):src.index("def _load_trusted_certs(")]
     cert_gen_seg = src[src.index("def _generate_cert("):src.index("def _cert_fingerprint(")]
     send_all_seg = src[src.index("def _send_all("):src.index("# =============================================\n# SHARED WORKER LOGIC")]
     new_session_seg = src[src.index("def new_session("):src.index("def kill_session(")]
+    close_session_seg = src[src.index("def _close_session_resources("):src.index("def _monitor_session(")]
     fork_monitor_seg = src[src.index("def _fork_monitor("):src.index("elif cmd == \"int\":")]
     tls_server_seg = src[src.index("class _TlsTerminatedServer:"):src.index("# =============================================\n# SHARED WORKER LOGIC")]
+    dispatch_seg = src[src.index("def _dispatch("):src.index("# =============================================\n# POSIX: real PTY worker")]
+    monitor_seg = src[src.index("def _monitor_session("):src.index("def send_session(")]
+    remote_seg = src[src.index("def _send_remote("):src.index("def connect_remote(")]
+    pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
+    main_seg = src[src.index("def main("):src.index("def pysh_main(")]
 
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
@@ -761,9 +804,28 @@ def test_connection_hardening_static():
     check("attach no direct ws_connect", "ws_connect" not in attach_seg)
     check("attach closes websocket on handshake failure",
           "ERR attach failed" in attach_seg and "ws.close()" in attach_seg)
+    check("attach reports failure", "-> bool" in attach_seg)
+    check("attach terminal setup failure detaches",
+          "ws.send(\"detach\")" in attach_seg and
+          "return False" in attach_seg)
+    check("attach rejects binary handshake response",
+          "isinstance(resp, bytes)" in attach_seg and
+          "ERR invalid attach response" in attach_seg)
+    check("attach POSIX requires TTY",
+          "sys.stdin.isatty()" in attach_pty_seg and
+          "attach requires a TTY" in attach_pty_seg)
+    check("attach sends resize on same connection",
+          "_send(\"resize\"" not in attach_seg and
+          "attach {name}{resize_args}" in attach_seg and
+          "_handle_resize([aname, args[1], args[2]])" in daemon_seg)
+    check("attach errors use public message",
+          "_public_error(e)" in attach_seg)
     check("send uses shared daemon connector", "_connect_daemon(" in send_seg)
+    check("send recv is bounded", "ws.recv(timeout=30)" in send_seg)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
+    check("websocket accept value is case-sensitive",
+          'header_map.get("sec-websocket-accept", "") != accept' in src)
     check("TLS bridge reaps threads", "def _reap_threads" in src and "self._reap_threads()" in src)
     check("TLS accept loop has timeout",
           "self._sock.settimeout(1.0)" in tls_server_seg and
@@ -772,6 +834,8 @@ def test_connection_hardening_static():
     check("handle_client no elif chain", "elif cmd" not in handle_seg)
     check("runtime dir uses private helper", "_ensure_private_dir" in runtime_seg)
     check("tls dir uses private helper", "_ensure_private_dir" in tls_seg)
+    check("private dir rejects insecure POSIX dirs",
+          "os.lstat(path)" in private_dir_seg and "st.st_uid" in private_dir_seg)
     check("trusted cert dirs use private helper",
           "_ensure_private_dir" in cert_dirs_seg and "os.makedirs" not in cert_dirs_seg)
     check("self-signed cert is not a CA",
@@ -780,11 +844,45 @@ def test_connection_hardening_static():
           "crl_sign=False" in cert_gen_seg)
     check("new_session rolls back failed registration",
           "_close_session_resources(session)" in new_session_seg)
+    check("worker entry has environment capability",
+          "_WORKER_ENV" in main_seg and
+          "env={**os.environ, _WORKER_ENV: \"1\"}" in new_session_seg)
+    check("kill closes PTY bridge",
+          "bridge.close()" in close_session_seg)
     check("fork monitor always marks done",
           "finally:\n                r[\"status\"] = \"done\"" in fork_monitor_seg)
+    check("fork monitor clears pid in finally",
+          "finally:\n                r[\"status\"] = \"done\"\n"
+          "                r[\"_done_at\"] = time.time()\n"
+          "                r[\"pid\"] = None" in fork_monitor_seg)
     check("fork monitor handles unexpected result failures",
           "(fork result read failed)" in fork_monitor_seg and
           "except Exception:" in fork_monitor_seg)
+    check("fork snapshots while locked",
+          "lock.acquire()" in dispatch_seg and "child_pid = os.fork()" in dispatch_seg)
+    check("fork closes fds on fork failure",
+          "for fd in (r_fd, w_fd):" in dispatch_seg)
+    check("namespace reads are lock-protected",
+          "with lock:" in dispatch_seg and "ns_snapshot = dict(ns)" in dispatch_seg)
+    check("int is serialized and ctypes is module-level",
+          "with _INTERRUPT_LOCK:" in dispatch_seg and
+          "import ctypes" not in dispatch_seg)
+    check("latest poll uses explicit cell sequence",
+          "\"_seq\": next(_CELL_SEQ)" in dispatch_seg and
+          "list(cells)[-1]" not in dispatch_seg)
+    check("stale monitor cannot kill replacement",
+          "sessions.get(name) is not s" in monitor_seg)
+    check("timed out command channel stays unhealthy",
+          "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
+    check("remote does not retry after send",
+          "remote response failed" in remote_seg and
+          "if attempt == 0:\n                    continue" in remote_seg)
+    check("pyctl exits nonzero on ERR",
+          "fail_on_err=True" in pyctl_seg)
+    check("malformed listen rejected",
+          "ERR --listen requires HOST:PORT" in src)
+    check("client-visible runtime errors are sanitized",
+          "_public_error(e)" in src and "return f\"ERR {e}\"" not in src)
 
 
 def test_has_crypto_flag():
@@ -1660,6 +1758,7 @@ def main():
         test_websocket_protocol,
         test_wire_message_builder,
         test_raw_wss_payload_limit,
+        test_raw_wss_leftover_and_fragments,
         test_tls_and_auth_hardening_static,
         test_connection_hardening_static,
         test_has_crypto_flag,

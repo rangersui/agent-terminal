@@ -117,6 +117,9 @@ import secrets
 import base64
 import hmac
 import re
+import stat
+import ctypes
+import itertools
 import typing
 
 __version__ = "0.3.0"
@@ -139,6 +142,12 @@ _WIN_ENABLE_PROCESSED_OUTPUT = 0x0001
 _WIN_ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
 _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _WS_CLOSE = object()
+_CELL_SEQ = itertools.count()
+_INTERRUPT_LOCK = threading.Lock()
+_WORKER_ENV = "PYTHOND_INTERNAL_WORKER"
+_SET_ASYNC_EXC: typing.Any = ctypes.pythonapi.PyThreadState_SetAsyncExc
+_SET_ASYNC_EXC.argtypes = [ctypes.c_ulong, ctypes.py_object]
+_SET_ASYNC_EXC.restype = ctypes.c_int
 
 _HAS_AF_UNIX = sys.platform != "win32" and hasattr(socket, "AF_UNIX")
 _HAS_PTY = False
@@ -178,22 +187,35 @@ SOCK = os.environ.get("PYTHOND_SOCK", _default_sock())
 def _validate_session_name(name: str) -> str:
     """Validate a session/proxy name before it becomes a filesystem path."""
     if (not isinstance(name, str) or not _SESSION_NAME_RE.fullmatch(name)
-            or ".." in name):
+            or ".." in name
+            or name in (".", "..")
+            or name.rstrip(" .") != name):
         raise ValueError("invalid session name")
     return name
+
+def _public_error(e: BaseException) -> str:
+    """Return a short client-facing error that does not expose host paths."""
+    msg = str(e)
+    if isinstance(e, ValueError):
+        return msg
+    if isinstance(e, RuntimeError) and "/" not in msg and "\\" not in msg:
+        return msg
+    return e.__class__.__name__
 
 def _ensure_private_dir(path: str) -> str:
     """Create a daemon data directory and restrict it to the current user."""
     created = not os.path.isdir(path)
     os.makedirs(path, exist_ok=True)
     if sys.platform == "win32":
-        if created:
-            _secure_path_win32(path)
+        _secure_path_win32(path)
     else:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise RuntimeError(f"insecure directory: {path}")
         try:
             os.chmod(path, 0o700)
         except OSError:
-            pass  # chmod hardening -- dir still works without it
+            raise RuntimeError(f"cannot secure directory: {path}")
     return path
 
 def _session_dir(name: str) -> str:
@@ -297,6 +319,7 @@ def _tcp_daemon_alive(meta: JsonDict) -> bool:
         return False
     if not token:
         return False
+    ws = None
     try:
         from websockets.sync.client import connect as ws_connect
         ws = ws_connect(f"ws://127.0.0.1:{port}/",
@@ -308,6 +331,29 @@ def _tcp_daemon_alive(meta: JsonDict) -> bool:
         resp = ws.recv(timeout=2)
         ws.close()
         return resp != "ERR auth failed"
+    except Exception:
+        return False
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+def _unix_daemon_alive() -> bool:
+    """Return True when the AF_UNIX daemon socket accepts a command."""
+    if not os.path.exists(SOCK):
+        return False
+    try:
+        from websockets.sync.client import unix_connect as ws_unix_connect
+        ws = ws_unix_connect(SOCK, open_timeout=2, close_timeout=1,
+                             subprotocols=[_WS_PROTO])
+        try:
+            ws.send("ls")
+            ws.recv(timeout=2)
+            return True
+        finally:
+            ws.close()
     except Exception:
         return False
 
@@ -778,9 +824,13 @@ def _make_exec(
                 stdout._local.buf = None
                 stderr._local.buf = None
             output = buf.getvalue().rstrip()
-            if on_done:
+            result = _ExecOutput(output, had_error)
+        if on_done:
+            try:
                 on_done(src, output)
-            return _ExecOutput(output, had_error)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        return result
     return _exec
 
 # Per-session in practice: each session runs in its own subprocess,
@@ -832,7 +882,8 @@ def _dispatch(
         # Tradeoff: threads can't be force-killed when stuck in C code
         # (requests.get, time.sleep).  pysh kill (whole session) is the escape.
         cid = uuid.uuid4().hex[:12]
-        res = {"output": "", "status": "running", "tid": None}
+        res = {"output": "", "status": "running", "tid": None,
+               "_seq": next(_CELL_SEQ)}
         def _bg(c: str = args[0], r: JsonDict = res) -> None:
             r["tid"] = threading.current_thread().ident
             try:
@@ -878,27 +929,40 @@ def _dispatch(
         # flush buffers) which deadlocks on locks held by threads that
         # don't exist in the child.  os._exit() skips all of that.
         r_fd, w_fd = os.pipe()
-        # Prevent fork child's subprocess from inheriting pipe fds.
-        # Without this, a grandchild process holds w_fd open -> parent's
-        # read never sees EOF -> monitor hangs.
+        child_pid = -1
+        fork_locked = False
         try:
-            os.set_inheritable(r_fd, False)
-            os.set_inheritable(w_fd, False)
-        except OSError:
-            pass
-        # Snapshot under lock for consistent namespace view, but fork OUTSIDE
-        # the lock.  Child inherits lock state -- if locked, no owning thread
-        # exists in child -> any code touching the lock deadlocks forever.
-        if lock:
-            with lock:
-                ns_snap = {k: id(v) for k, v in ns.items()}
-        else:
+            # Prevent fork child's subprocess from inheriting pipe fds.
+            # Without this, a grandchild process holds w_fd open -> parent's
+            # read never sees EOF -> monitor hangs.
+            try:
+                os.set_inheritable(r_fd, False)
+                os.set_inheritable(w_fd, False)
+            except OSError:
+                pass
+            # Snapshot and fork under the same lock so the diff base and child
+            # image match.  The child releases its inherited copy immediately
+            # before evaluating user code.
+            if lock:
+                lock.acquire()
+                fork_locked = True
             ns_snap = {k: id(v) for k, v in ns.items()}
-        # Small race window: fire thread could modify ns between snapshot
-        # and fork.  Acceptable -- fork merge is already last-writer-wins.
-        child_pid = os.fork()
+            child_pid = os.fork()
+        except BaseException:
+            if fork_locked and lock:
+                lock.release()
+            for fd in (r_fd, w_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        if child_pid != 0 and fork_locked and lock:
+            lock.release()
         if child_pid == 0:
             # --- child process (exits via os._exit, no Python cleanup) ---
+            if fork_locked and lock:
+                lock.release()
             os.close(r_fd)
             try:
                 buf = io.StringIO()
@@ -924,7 +988,7 @@ def _dispatch(
                         try:
                             pickle.dumps(v)
                             diff[k] = v
-                        except (pickle.PicklingError, TypeError, AttributeError):
+                        except Exception:
                             skipped.append(k)
                 payload = pickle.dumps({"output": output, "_error": had_error,
                                         "diff": diff,
@@ -946,7 +1010,8 @@ def _dispatch(
                 os._exit(0)  # skip all Python cleanup -- no deadlocks
         # --- parent process ---
         os.close(w_fd)
-        res = {"output": "", "status": "running", "pid": child_pid}
+        res = {"output": "", "status": "running", "pid": child_pid,
+               "_seq": next(_CELL_SEQ)}
         def _fork_monitor(r: JsonDict = res, fd: int = r_fd, pid: int = child_pid) -> None:
             """Read pipe first (unblocks child write), then reap child."""
             # Must read before waitpid: if child writes a large payload
@@ -1001,7 +1066,7 @@ def _dispatch(
             finally:
                 r["status"] = "done"
                 r["_done_at"] = time.time()
-            r["pid"] = None
+                r["pid"] = None
         with _cells_lock:
             cells[cid] = res
             _evict_stale_cells(cells)
@@ -1014,32 +1079,31 @@ def _dispatch(
         #   fork'd cells (processes): SIGKILL -- hard kill, stops anything.
         # Note: run blocks the AI loop, so int can't reach the worker while
         # run is executing.  Use fork for code that might hang.
-        import ctypes
-        _set_async = ctypes.pythonapi.PyThreadState_SetAsyncExc
-        _set_async.argtypes = [ctypes.c_ulong, ctypes.py_object]
-        _set_async.restype = ctypes.c_int
         threads = 0
         processes = 0
-        with _cells_lock:
-            snapshot = list(cells.items())
-        for cid, r in snapshot:
-            if r["status"] != "running":
-                continue
-            tid = r.get("tid")
-            pid = r.get("pid")
-            if tid:
-                rc = _set_async(ctypes.c_ulong(tid),
-                                ctypes.py_object(KeyboardInterrupt))
-                if rc > 1:
-                    _set_async(ctypes.c_ulong(tid), ctypes.py_object(None))
-                if rc >= 1:
-                    threads += 1
-            elif pid:
-                try:
-                    os.kill(pid, signal.SIGKILL)  # type: ignore[attr-defined]
-                    processes += 1
-                except (OSError, ProcessLookupError):
-                    pass  # already dead
+        with _INTERRUPT_LOCK:
+            with _cells_lock:
+                snapshot = list(cells.items())
+            for cid, r in snapshot:
+                if r["status"] != "running":
+                    continue
+                tid = r.get("tid")
+                pid = r.get("pid")
+                if tid:
+                    rc = _SET_ASYNC_EXC(
+                        ctypes.c_ulong(tid),
+                        ctypes.py_object(KeyboardInterrupt),
+                    )
+                    if rc > 1:
+                        _SET_ASYNC_EXC(ctypes.c_ulong(tid), ctypes.py_object(None))
+                    if rc >= 1:
+                        threads += 1
+                elif pid:
+                    try:
+                        os.kill(pid, signal.SIGKILL)  # type: ignore[attr-defined]
+                        processes += 1
+                    except (OSError, ProcessLookupError):
+                        pass  # already dead
         return {"threads": threads, "processes": processes,
                 "note": "thread interrupts are best-effort; "
                         "fork processes are hard-killed"}
@@ -1065,8 +1129,10 @@ def _dispatch(
             _evict_stale_cells(cells)
             if not cells:
                 return {"status": "idle"}
-            last_id = list(cells)[-1]
-            r = cells[last_id]
+            last_id, r = max(
+                cells.items(),
+                key=lambda item: typing.cast(int, item[1].get("_seq", -1)),
+            )
         resp = {"cell_id": last_id, "status": r["status"],
                  "output": r["output"]}
         if r.get("_error"):
@@ -1076,7 +1142,12 @@ def _dispatch(
             resp["skipped"] = r["_skipped"]
         return resp
     elif cmd == "status":
-        vs = len([v for v in ns if not v.startswith("_")])
+        if lock:
+            with lock:
+                public_names = [v for v in ns if not v.startswith("_")]
+        else:
+            public_names = [v for v in ns if not v.startswith("_")]
+        vs = len(public_names)
         with _cells_lock:
             _evict_stale_cells(cells)
             running = [cid for cid, r in cells.items()
@@ -1085,11 +1156,21 @@ def _dispatch(
         return {"state": "running" if running else "idle",
                 "running": running, "vars": vs, "cells": ncells}
     elif cmd == "vars":
-        return {"vars": [v for v in ns if not v.startswith("_")]}
+        if lock:
+            with lock:
+                public_names = [v for v in ns if not v.startswith("_")]
+        else:
+            public_names = [v for v in ns if not v.startswith("_")]
+        return {"vars": public_names}
     elif cmd == "complete":
         import rlcompleter
         text = args[0] if args else ""
-        c = rlcompleter.Completer(ns)
+        if lock:
+            with lock:
+                ns_snapshot = dict(ns)
+        else:
+            ns_snapshot = dict(ns)
+        c = rlcompleter.Completer(ns_snapshot)
         matches = []
         for i in range(200):
             m = c.complete(text, i)
@@ -1259,7 +1340,9 @@ class PtyBridge:
                 try:
                     send_fn(bytes(self._scrollback))
                 except Exception:
-                    pass  # scrollback flush failed -- not critical
+                    self._send_fn = None
+                    self._owner = None
+                    return None
                 self._scrollback.clear()
             return owner
 
@@ -1270,6 +1353,13 @@ class PtyBridge:
                 return
             self._send_fn = None
             self._owner = None
+
+    def close(self) -> None:
+        """Drop any attached client and buffered PTY output during session kill."""
+        with self._lock:
+            self._send_fn = None
+            self._owner = None
+            self._scrollback.clear()
 
     def write(self, data: bytes) -> None:
         """Client -> PTY input."""
@@ -1289,7 +1379,11 @@ class PtyBridge:
                     try:
                         self._send_fn(data)
                     except Exception:
+                        self._scrollback.extend(data)
+                        if len(self._scrollback) > self._MAX:
+                            del self._scrollback[:-self._MAX]
                         self._send_fn = None
+                        self._owner = None
                 else:
                     self._scrollback.extend(data)
                     if len(self._scrollback) > self._MAX:
@@ -1308,10 +1402,18 @@ def new_session(name: str) -> None:
         ai_port = ai_srv.getsockname()[1]
         ai_srv.listen(1)
         ai_srv.settimeout(10)
-        proc = _WinPty.spawn(
-            [sys.executable, os.path.abspath(__file__),
-             "_worker_winpty", str(ai_port)]
-        )
+        old_worker_env = os.environ.get(_WORKER_ENV)
+        os.environ[_WORKER_ENV] = "1"
+        try:
+            proc = _WinPty.spawn(
+                [sys.executable, os.path.abspath(__file__),
+                 "_worker_winpty", str(ai_port)]
+            )
+        finally:
+            if old_worker_env is None:
+                os.environ.pop(_WORKER_ENV, None)
+            else:
+                os.environ[_WORKER_ENV] = old_worker_env
         try:
             ai_conn, _ = ai_srv.accept()
         except socket.timeout:
@@ -1345,6 +1447,7 @@ def new_session(name: str) -> None:
              "_worker_pty", str(slave_fd), str(ai_child.fileno())],
             close_fds=True,
             pass_fds=(slave_fd, ai_child.fileno()),
+            env={**os.environ, _WORKER_ENV: "1"},
         )
         os.close(slave_fd)
         ai_child.close()
@@ -1389,6 +1492,9 @@ def _close_session_resources(s: JsonDict) -> bool:
                 pass  # cleanup must not raise -- resources may already be dead
         return True
     if s["type"] == "pty":
+        bridge = s.get("bridge")
+        if bridge is not None:
+            bridge.close()
         if "winpty" in s:
             try:
                 if s["winpty"].isalive():
@@ -1458,7 +1564,11 @@ def _monitor_session(name: str) -> None:
             s["proc"].join()
     except Exception:
         pass  # process exited abnormally -- still need to reap
-    kill_session(name)  # pop is atomic under _sessions_lock
+    with _sessions_lock:
+        if sessions.get(name) is not s:
+            return
+        sessions.pop(name, None)
+    _close_session_resources(s)
 
 def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
     """Send one AI command to a session and wait for its response.
@@ -1473,9 +1583,9 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
     with _session_lock(s):
         if _get_session(name) is not s:
             return {"error": f"session '{name}' not found"}
-        if s.get("_unhealthy") and msg.get("cmd") != "int":
+        if s.get("_unhealthy"):
             return {"error": f"session '{name}' command channel out of sync after timeout; "
-                    f"use pysh int {name} or pysh kill {name}"}
+                    f"use pysh kill {name}"}
         if s["type"] == "remote":
             return _send_remote(s, msg, timeout)
         if s["type"] == "pty":
@@ -1490,8 +1600,6 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
                 if not line:
                     return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
                 resp: dict[str, typing.Any] = json.loads(line)
-                if msg.get("cmd") == "int":
-                    s.pop("_unhealthy", None)
                 return resp
             except socket.timeout:
                 s["_unhealthy"] = True
@@ -1563,6 +1671,7 @@ class _RawWssClient:
 
     def __init__(self, sock: SocketLike) -> None:
         self.sock = sock
+        self._recv_buf = b""
 
     @classmethod
     def connect(
@@ -1591,23 +1700,34 @@ class _RawWssClient:
                 headers.append(f"Authorization: Bearer {token}")
             request = "\r\n".join(headers) + "\r\n\r\n"
             sock.sendall(request.encode("ascii"))
-            response = cls._read_http_response(sock)
+            response, leftover = cls._read_http_response(sock)
             if not response.startswith(b"HTTP/1.1 101 "):
                 raise RuntimeError(response.split(b"\r\n", 1)[0].decode(
                     "latin1", "replace"))
+            header_map: dict[str, str] = {}
+            for line in response.split(b"\r\n")[1:]:
+                if b":" not in line:
+                    continue
+                key_b, value_b = line.split(b":", 1)
+                header_map[key_b.decode("latin1").strip().lower()] = (
+                    value_b.decode("latin1").strip()
+                )
             accept = base64.b64encode(_hashlib.sha1(
                 (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(
                     "ascii")).digest()).decode("ascii")
-            if f"sec-websocket-accept: {accept.lower()}".encode(
-                    "ascii") not in response.lower():
+            if header_map.get("sec-websocket-accept", "") != accept:
                 raise RuntimeError("bad websocket accept")
-            return cls(sock)
+            if header_map.get("sec-websocket-protocol") != _WS_PROTO:
+                raise RuntimeError("bad websocket protocol")
+            client = cls(sock)
+            client._recv_buf = leftover
+            return client
         except Exception:
             raw.close()
             raise
 
     @staticmethod
-    def _read_http_response(sock: SocketLike) -> bytes:
+    def _read_http_response(sock: SocketLike) -> tuple[bytes, bytes]:
         data = b""
         while b"\r\n\r\n" not in data:
             chunk = sock.recv(4096)
@@ -1616,7 +1736,8 @@ class _RawWssClient:
             data += chunk
             if len(data) > _WS_HANDSHAKE_LIMIT:
                 raise RuntimeError("websocket handshake too large")
-        return data
+        header, leftover = data.split(b"\r\n\r\n", 1)
+        return header + b"\r\n\r\n", leftover
 
     def send(self, data: str | bytes) -> None:
         if isinstance(data, bytes):
@@ -1632,8 +1753,28 @@ class _RawWssClient:
         if timeout is not None:
             self.sock.settimeout(timeout)
         try:
+            message_opcode: int | None = None
+            message_parts: list[bytes] = []
             while True:
-                opcode, payload = self._recv_frame()
+                fin, opcode, payload = self._recv_frame()
+                if opcode in (0x1, 0x2):
+                    if fin:
+                        if opcode == 0x1:
+                            return payload.decode("utf-8", "replace")
+                        return payload
+                    message_opcode = opcode
+                    message_parts = [payload]
+                    continue
+                if opcode == 0x0:
+                    if message_opcode is None:
+                        raise RuntimeError("unexpected websocket continuation")
+                    message_parts.append(payload)
+                    if not fin:
+                        continue
+                    payload = b"".join(message_parts)
+                    opcode = message_opcode
+                    message_opcode = None
+                    message_parts = []
                 if opcode == 0x1:
                     return payload.decode("utf-8", "replace")
                 if opcode == 0x2:
@@ -1669,8 +1810,11 @@ class _RawWssClient:
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         self.sock.sendall(header + mask + masked)
 
-    def _recv_frame(self) -> tuple[int, bytes]:
+    def _recv_frame(self) -> tuple[bool, int, bytes]:
         header = self._recv_exact(2)
+        fin = bool(header[0] & 0x80)
+        if header[0] & 0x70:
+            raise RuntimeError("unsupported websocket extension bits")
         opcode = header[0] & 0x0F
         length = header[1] & 0x7F
         masked = bool(header[1] & 0x80)
@@ -1684,10 +1828,14 @@ class _RawWssClient:
         payload = self._recv_exact(length)
         if masked:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        return opcode, payload
+        return fin, opcode, payload
 
     def _recv_exact(self, n: int) -> bytes:
         data = b""
+        if self._recv_buf:
+            take = min(n, len(self._recv_buf))
+            data += self._recv_buf[:take]
+            self._recv_buf = self._recv_buf[take:]
         while len(data) < n:
             chunk = self.sock.recv(n - len(data))
             if not chunk:
@@ -1801,28 +1949,39 @@ def _send_remote(
                                      timeout=10)
                 session["_ws"] = ws
             except Exception:
+                if attempt == 0:
+                    continue
                 return {"error": "remote connect failed"}
         try:
             ws.send(ws_msg)
-            resp = ws.recv(timeout=timeout)
-            if resp is _WS_CLOSE:
-                raise RuntimeError("remote closed")
-            if cmd == "run":
-                return {"output": resp}
-            try:
-                parsed: dict[str, typing.Any] = json.loads(resp)
-                return parsed
-            except json.JSONDecodeError:
-                return {"output": resp}
         except Exception:
             session["_ws"] = None
             try:
                 ws.close()
             except Exception:
-                pass  # reconnect attempt -- clear and retry
-            if attempt == 0:
-                continue
-            return {"error": "remote unreachable"}
+                pass  # stale connection -- clear it
+            return {"error": "remote send failed"}
+        try:
+            resp = ws.recv(timeout=timeout)
+        except Exception:
+            session["_ws"] = None
+            try:
+                ws.close()
+            except Exception:
+                pass  # stale connection -- clear it
+            return {"error": "remote response failed"}
+        if resp is _WS_CLOSE:
+            session["_ws"] = None
+            return {"error": "remote closed"}
+        if isinstance(resp, str) and resp.startswith("ERR "):
+            return {"error": resp[4:]}
+        if cmd == "run":
+            return {"output": resp}
+        try:
+            parsed: dict[str, typing.Any] = json.loads(resp)
+            return parsed
+        except json.JSONDecodeError:
+            return {"output": resp}
     return {"error": "remote unreachable"}
 
 def connect_remote(
@@ -1836,21 +1995,27 @@ def connect_remote(
     try:
         _ensure_session_capacity(name)
     except (ValueError, RuntimeError) as e:
-        return f"ERR {e}"
+        return f"ERR {_public_error(e)}"
     if _get_session(name) is not None:
         kill_session(name)
     # test connectivity + auth now; actual data goes through _send_remote
     # which reconnects lazily.  This test catches bad host/port/token early
     # but doesn't guarantee future requests succeed (network can change).
+    ws = None
     try:
         ws = _open_remote_ws(host, port, token, use_tls=use_tls, timeout=10)
         ws.send("ls")
         resp = ws.recv(timeout=5)
-        ws.close()
         if resp == "ERR auth failed":
             return "ERR auth failed on remote"
     except Exception:
         return "ERR cannot reach remote"
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
     try:
         _set_session(name, {
             "type": "remote",
@@ -1858,7 +2023,7 @@ def connect_remote(
             "tls": use_tls,
         })
     except RuntimeError as e:
-        return f"ERR {e}"
+        return f"ERR {_public_error(e)}"
     return f"OK connected {name} -> {host}:{port}{' tls' if use_tls else ''}"
 
 def _handle_stop(args: list[str]) -> str:
@@ -1909,7 +2074,7 @@ def _handle_new(args: list[str]) -> str:
     try:
         new_session(name)
     except (ValueError, RuntimeError) as e:
-        return f"ERR {e}"
+        return f"ERR {_public_error(e)}"
     s = _get_session(name)
     if s is None:
         return f"ERR failed to create session '{name}'"
@@ -1958,6 +2123,8 @@ def _handle_resize(args: list[str]) -> str:
         name, rows, cols = args[0], int(args[1]), int(args[2])
     except ValueError:
         return "ERR rows/cols must be integers"
+    if not (1 <= rows <= 65535 and 1 <= cols <= 65535):
+        return "ERR rows/cols out of range"
     s = _get_session(name)
     if s is None:
         return f"ERR no session '{name}'"
@@ -2025,7 +2192,7 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
         return f"ERR no session '{name}' -- pysh new {name}"
     inner_args = args[1:]
     if cmd in ("run", "fire", "fork") and inner_args:
-        code_str = inner_args[0]
+        code_str = inner_args[-1] if s["type"] == "remote" else inner_args[0]
         lines = code_str.strip().splitlines()
         pfx = f"{name}>>> " if len(_session_snapshot()) > 1 else ">>> "
         cont = "." * len(pfx.rstrip()) + " "
@@ -2037,14 +2204,17 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
 
     exec_error = bool(resp.pop("_error", False))
     if cmd == "run" and inner_args and "error" not in resp:
-        src = inner_args[0]
+        src = inner_args[-1] if s["type"] == "remote" else inner_args[0]
         output = resp.get("output", "")
         _log_session(name, src, output, error=exec_error)
         if not exec_error and src.strip():
             _log_history(name, src)
     elif cmd in ("fire", "fork") and inner_args and "error" not in resp:
-        _log_cell_launch(name, inner_args[0], resp)
+        src = inner_args[-1] if s["type"] == "remote" else inner_args[0]
+        _log_cell_launch(name, src, resp)
     elif cmd == "poll" and "error" not in resp and resp.get("status") == "done":
+        if exec_error:
+            resp["error"] = True
         _log_cell_poll(name, resp, exec_error)
 
     if list(resp.keys()) == ["output"]:
@@ -2153,7 +2323,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             try:
                 _write_daemon_meta(port, _daemon_token)
             except RuntimeError as e:
-                print(f"ERR {e}", file=sys.stderr)
+                print(f"ERR {_public_error(e)}", file=sys.stderr)
                 raise SystemExit(1)
 
     # --- connection handler (one thread per connection) ---
@@ -2199,12 +2369,17 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 if not bridge:
                     ws.send(f"ERR session '{aname}' has no PTY")
                     continue
+                if len(args) >= 3:
+                    resize_resp = _handle_resize([aname, args[1], args[2]])
+                    if resize_resp != "OK":
+                        ws.send(resize_resp)
+                        continue
                 owner = bridge.attach(lambda data: ws.send(data))
                 if owner is None:
                     ws.send(f"ERR session '{aname}' already attached")
                     continue
-                ws.send("OK attached")
                 try:
+                    ws.send("OK attached")
                     for frame in ws:
                         if isinstance(frame, str):
                             if frame.strip() in ("detach", ""):
@@ -2235,16 +2410,17 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
 
     def _stop(signum: int, frame: typing.Any) -> None:
         if server:
-            server.shutdown()
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     old_sigterm = None
+    old_sigbreak = None
     try:
         old_sigterm = signal.signal(signal.SIGTERM, _stop)
     except (AttributeError, ValueError):
         pass  # signal not available on this platform
     if hasattr(signal, "SIGBREAK"):
         try:
-            signal.signal(signal.SIGBREAK, _stop)
+            old_sigbreak = signal.signal(signal.SIGBREAK, _stop)
         except (AttributeError, ValueError):
             pass  # signal not available on this platform
 
@@ -2290,13 +2466,18 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
     except KeyboardInterrupt:
         pass  # normal shutdown path
     except OSError as e:
-        print(f"ERR {e}", file=sys.stderr)
+        print(f"ERR {_public_error(e)}", file=sys.stderr)
         raise SystemExit(1)
     finally:
         print(f"\npythond stopped -- {_WS_HELLO}", file=sys.stderr)
         if old_sigterm is not None:
             try:
                 signal.signal(signal.SIGTERM, old_sigterm)
+            except (AttributeError, ValueError):
+                pass  # signal not available on this platform
+        if old_sigbreak is not None and hasattr(signal, "SIGBREAK"):
+            try:
+                signal.signal(signal.SIGBREAK, old_sigbreak)
             except (AttributeError, ValueError):
                 pass  # signal not available on this platform
         try:
@@ -2326,8 +2507,9 @@ def _send(cmd: str, args: list[str]) -> str | None:
     msg = _build_wire_message(cmd, args)
     try:
         ws.send(msg)
-        resp = ws.recv()
+        resp = ws.recv(timeout=30)
         if resp is _WS_CLOSE:
+            ws.close()
             return None
         ws.close()
         return typing.cast(str, resp)
@@ -2338,7 +2520,7 @@ def _send(cmd: str, args: list[str]) -> str | None:
             pass  # connection closed -- return None to caller
         return None
 
-def client(cmd: str, args: list[str]) -> None:
+def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
     """CLI client for non-interactive commands."""
     resp = _send(cmd, args)
     if resp is None:
@@ -2346,45 +2528,61 @@ def client(cmd: str, args: list[str]) -> None:
         sys.exit(1)
     if resp:
         print(resp)
+    if fail_on_err and resp.startswith("ERR "):
+        sys.exit(1)
 
-def attach(name: str) -> None:
+def attach(name: str) -> bool:
     """Connect a human terminal to a session REPL via WebSocket binary frames.
     Ctrl-] detaches. Session stays alive."""
     try:
         ws = _connect_daemon(timeout=5)
     except Exception as e:
-        print(f"ERR connect failed: {e}", file=sys.stderr)
-        return
+        print(f"ERR connect failed: {_public_error(e)}", file=sys.stderr)
+        return False
 
     # request attach
+    resize_args = ""
     try:
-        ws.send(f"attach {name}")
+        rows, cols = os.get_terminal_size()
+        resize_args = f" {rows} {cols}"
+    except OSError:
+        pass  # non-interactive or detached terminal -- attach can still try
+    try:
+        ws.send(f"attach {name}{resize_args}")
         resp = ws.recv(timeout=5)
     except Exception as e:
         try:
             ws.close()
         except Exception:
             pass  # connection closing -- send/close may fail
-        print(f"ERR attach failed: {e}", file=sys.stderr)
-        return
+        print(f"ERR attach failed: {_public_error(e)}", file=sys.stderr)
+        return False
     if resp is _WS_CLOSE:
         resp = "ERR daemon closed connection"
+    if isinstance(resp, bytes):
+        resp = "ERR invalid attach response"
     if not resp.startswith("OK"):
         print(resp, file=sys.stderr)
         ws.close()
-        return
+        return False
 
-    # resize
     try:
-        rows, cols = os.get_terminal_size()
-        _send("resize", [name, str(rows), str(cols)])
-    except OSError:
-        pass  # terminal restore -- best effort on exit
-
-    if sys.platform == "win32":
-        _attach_ws_win(ws, name)
-    else:
-        _attach_ws_pty(ws, name)
+        if sys.platform == "win32":
+            _attach_ws_win(ws, name)
+        else:
+            _attach_ws_pty(ws, name)
+    except Exception as e:
+        try:
+            ws.send("detach")
+        except Exception:
+            pass  # connection closing -- send/close may fail
+        try:
+            ws.close()
+        except Exception:
+            pass  # connection closing -- send/close may fail
+        print(f"ERR attach failed: {_public_error(e)}", file=sys.stderr)
+        return False
+    return True
 
 def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
     """WebSocket output -> stdout for both POSIX and Windows attach."""
@@ -2444,6 +2642,8 @@ def _attach_ws_loop(
 
 def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> None:
     """POSIX raw terminal attach via WebSocket."""
+    if not sys.stdin.isatty():
+        raise RuntimeError("attach requires a TTY")
     old = termios.tcgetattr(sys.stdin)  # type: ignore[name-defined]
     tty.setraw(sys.stdin)  # type: ignore[name-defined]
 
@@ -2543,7 +2743,12 @@ def main() -> None:
         print(f"pythond {__version__}")
         sys.exit(0)
     if argv[0].startswith("_worker"):
-        _worker_entry(argv)
+        if os.environ.get(_WORKER_ENV) != "1":
+            print("ERR internal worker entry point", file=sys.stderr)
+            sys.exit(1)
+        if not _worker_entry(argv):
+            print(f"ERR unknown worker command: {argv[0]}", file=sys.stderr)
+            sys.exit(1)
         return
     if argv[0] == "daemon":
         show = "--show-token" in argv
@@ -2552,10 +2757,14 @@ def main() -> None:
         for i, a in enumerate(argv):
             if a == "--listen" and i + 1 < len(argv):
                 listen = argv[i + 1]
+            elif a == "--listen":
+                print("ERR --listen requires HOST:PORT", file=sys.stderr)
+                sys.exit(1)
         daemon(show_token=show, listen_addr=listen, tls=use_tls)
     elif argv[0] == "attach":
         name = argv[1] if len(argv) > 1 else "default"
-        attach(name)
+        if not attach(name):
+            sys.exit(1)
     else:
         client(argv[0], argv[1:])
 
@@ -2592,7 +2801,8 @@ def pysh_main() -> None:
         sys.exit(0)
     if argv[0] == "attach":
         name = argv[1] if len(argv) > 1 else "default"
-        attach(name)
+        if not attach(name):
+            sys.exit(1)
     else:
         client(argv[0], argv[1:])
 
@@ -2634,17 +2844,20 @@ def pyctl_main() -> None:
         for i, a in enumerate(argv):
             if a == "--listen" and i + 1 < len(argv):
                 listen = argv[i + 1]
+            elif a == "--listen":
+                print("ERR --listen requires HOST:PORT", file=sys.stderr)
+                sys.exit(1)
         daemon(show_token=show, listen_addr=listen, tls=use_tls)
     elif argv[0] == "stop":
-        client("stop", argv[1:])
+        client("stop", argv[1:], fail_on_err=True)
     elif argv[0] == "connect":
         # pyctl connect <name> <host:port> <token> [--tls]
         # -> tells the daemon to proxy to a remote pythond
-        client("connect", argv[1:])
+        client("connect", argv[1:], fail_on_err=True)
     elif argv[0] == "disconnect":
         # pyctl disconnect <name>
         # -> tells the daemon to drop a remote proxy
-        client("disconnect", argv[1:])
+        client("disconnect", argv[1:], fail_on_err=True)
     elif argv[0] == "trust":
         if len(argv) < 2:
             print("usage: pyctl trust <cert.pem>  (let this client in)", file=sys.stderr)
@@ -2679,7 +2892,7 @@ def pyctl_main() -> None:
     elif argv[0] == "status":
         meta = _read_daemon_meta()
         if _HAS_AF_UNIX:
-            alive = os.path.exists(SOCK)
+            alive = _unix_daemon_alive()
             print(f"socket: {SOCK}")
             print(f"alive: {alive}")
         elif meta:
