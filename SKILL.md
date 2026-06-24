@@ -211,6 +211,13 @@ Treat pythond like SSH into a Python runtime.
   They include `conn_id`, peer, `cmd`, session, status, and `body_bytes`; they
   do not include token values or Python code bodies.
 
+Runtime files and durable state are separate:
+
+| Purpose | Windows | POSIX |
+| --- | --- | --- |
+| daemon metadata/logs | `%LOCALAPPDATA%\pythond\daemon.json`, `%LOCALAPPDATA%\pythond\access.log` | `$XDG_RUNTIME_DIR/pythond/` or `/tmp/pythond-$UID/` |
+| session state/certs | `~\.pythond\sessions\...`, `~\.pythond\tls\...` | `~/.pythond/sessions/...`, `~/.pythond/tls/...` |
+
 ### TLS cert management
 
 ```bash

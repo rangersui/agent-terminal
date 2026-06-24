@@ -279,6 +279,13 @@ Access logs are for daemon operations: connection id, peer, cmd, session,
 status, and body size. They deliberately do not record tokens or Python source.
 Use `session.log` when you need the executed code and output.
 
+Runtime files and durable state live in different places:
+
+| Purpose | Windows | POSIX |
+|---------|---------|-------|
+| daemon metadata/logs | `%LOCALAPPDATA%\pythond\daemon.json`, `%LOCALAPPDATA%\pythond\access.log` | `$XDG_RUNTIME_DIR/pythond/` or `/tmp/pythond-$UID/` |
+| session state/certs | `~\.pythond\sessions\...`, `~\.pythond\tls\...` | `~/.pythond/sessions/...`, `~/.pythond/tls/...` |
+
 ## Cross-platform
 
 | Platform | PTY | Transport | Notes |

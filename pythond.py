@@ -289,6 +289,9 @@ def _access_log(
     was used without leaking tokens or code bodies.  The file is durable local
     evidence; stderr gives supervisors and service managers the live stream.
     """
+    def _field(value: str) -> str:
+        return value if _SESSION_NAME_RE.fullmatch(value) else "invalid"
+
     fields = [
         "ACCESS",
         f"ts={_utc_timestamp_ms()}",
@@ -300,7 +303,7 @@ def _access_log(
     if cmd is not None:
         fields.append(f"cmd={cmd or '-'}")
     if session is not None:
-        fields.append(f"session={session or '-'}")
+        fields.append(f"session={_field(session) if session else '-'}")
     if status is not None:
         fields.append(f"status={status}")
     if body_bytes is not None:
@@ -3475,11 +3478,14 @@ def pyctl_main() -> None:
             sys.exit(1)
         cert, key = _generate_cert()
         fp = _cert_fingerprint(cert)
+        print("this machine's TLS certificate:")
         print(f"cert: {cert}")
         print(f"key:  {key}")
         print(f"fingerprint: {fp}")
-        print(f"\nOn server:  pyctl trust {cert}")
-        print(f"On client:  pyctl pin {cert}")
+        print("\nIf this machine is the client:")
+        print(f"  copy {cert} to the server and run: pyctl trust <copied-client-cert.pem>")
+        print("If this machine is the server:")
+        print(f"  copy {cert} to the client and run: pyctl pin <copied-server-cert.pem>")
     elif args.command == "status":
         meta = _read_daemon_meta()
         alive = False

@@ -1087,6 +1087,8 @@ def test_tls_and_auth_hardening_static():
           "_ACCESS_STDERR_QUEUE.put_nowait(line)" in access_mirror_seg and
           "threading.Thread(target=_access_stderr_worker, daemon=True)" in access_mirror_seg and
           "sys.stderr.write(line)" in access_mirror_seg)
+    check("access log sanitises invalid session names",
+          "_field(session)" in access_log_seg and "invalid" in access_log_seg)
     ctx = pythond._client_ssl_ctx()
     check("client TLS minimum 1.2",
           getattr(ctx, "minimum_version", None) >= pythond._ssl.TLSVersion.TLSv1_2)
@@ -1501,6 +1503,33 @@ def test_session_cli_errors_exit_nonzero():
                 check(f"{entry_name} exits nonzero on ERR", False)
             except SystemExit as e:
                 check(f"{entry_name} exits nonzero on ERR", e.code == 1, e.code)
+
+
+def test_access_log_sanitises_session_field():
+    section("access log sanitises session field")
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(pythond, "_runtime_dir", return_value=td), \
+             mock.patch.object(pythond, "_mirror_access_log_to_stderr"):
+            pythond._access_log("command", cmd="run", session="../../secret",
+                                body_bytes=12)
+        content = open(os.path.join(td, "access.log"), encoding="utf-8").read()
+    check("invalid session redacted", "session=invalid" in content, content)
+    check("raw invalid session omitted", "../../secret" not in content, content)
+
+
+def test_pyctl_cert_role_hints():
+    section("pyctl cert role hints")
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(sys, "argv", ["pyctl", "cert"]), \
+             mock.patch.object(pythond, "_tls_dir", return_value=td), \
+             mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            pythond.pyctl_main()
+        text = out.getvalue()
+    check("cert output says this machine", "this machine's TLS certificate" in text)
+    check("cert output separates client role",
+          "If this machine is the client:" in text and "pyctl trust" in text)
+    check("cert output separates server role",
+          "If this machine is the server:" in text and "pyctl pin" in text)
 
 
 def test_default_sock():
@@ -2445,6 +2474,8 @@ def main():
         test_has_crypto_flag,
         test_entry_points_exist,
         test_session_cli_errors_exit_nonzero,
+        test_access_log_sanitises_session_field,
+        test_pyctl_cert_role_hints,
         test_default_sock,
         test_secure_path_win32,
 
