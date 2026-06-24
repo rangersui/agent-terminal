@@ -1709,7 +1709,8 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
             with contextlib.suppress(OSError):
                 ai_sock.close()
 
-    threading.Thread(target=_ai_loop, daemon=True).start()
+    ai_thread = threading.Thread(target=_ai_loop, daemon=True)
+    ai_thread.start()
 
     class LockedConsole(code.InteractiveConsole):
         """InteractiveConsole that holds the session lock during eval."""
@@ -1739,6 +1740,7 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
             ai_sock.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
             ai_sock.close()
+        ai_thread.join(timeout=1)
 # =============================================
 # DAEMON -- socket + process manager
 # =============================================

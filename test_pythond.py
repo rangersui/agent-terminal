@@ -2255,6 +2255,13 @@ def wait_until(predicate, timeout=5.0, interval=0.05):
         time.sleep(interval)
     return bool(predicate())
 
+def private_unix_sock(prefix):
+    """Return (dir, socket_path) in a private directory."""
+    d = tempfile.mkdtemp(prefix=prefix)
+    if sys.platform != "win32":
+        os.chmod(d, 0o700)
+    return d, os.path.join(d, "pythond.sock")
+
 _HAS_AF_UNIX = sys.platform != "win32" and hasattr(socket, "AF_UNIX")
 
 
@@ -2266,7 +2273,7 @@ def test_integration():
         print("  SKIP: integration tests use AF_UNIX (run on WSL/Linux)")
         return
 
-    sock = os.path.join(tempfile.gettempdir(), f"pythond-test-{os.getpid()}.sock")
+    sock_dir, sock = private_unix_sock("pythond-test-")
     env = os.environ.copy()
     env["PYTHOND_SOCK"] = sock
 
@@ -2385,6 +2392,7 @@ def test_integration():
                 proc.wait(timeout=3)
         if os.path.exists(sock):
             os.unlink(sock)
+        shutil.rmtree(sock_dir, ignore_errors=True)
         # cleanup checkpoint files
         shutil.rmtree(os.path.join(os.path.expanduser("~"),
                                    ".pythond", "sessions", "test1"),
@@ -2634,7 +2642,7 @@ def test_integration_error_not_in_history():
         print("  SKIP: integration tests use AF_UNIX")
         return
 
-    sock = os.path.join(tempfile.gettempdir(), f"pythond-test2-{os.getpid()}.sock")
+    sock_dir, sock = private_unix_sock("pythond-test2-")
     env = os.environ.copy()
     env["PYTHOND_SOCK"] = sock
     name = "__errtest__"
@@ -2675,6 +2683,7 @@ def test_integration_error_not_in_history():
                 proc.wait(timeout=3)
         if os.path.exists(sock):
             os.unlink(sock)
+        shutil.rmtree(sock_dir, ignore_errors=True)
         shutil.rmtree(os.path.join(os.path.expanduser("~"),
                                    ".pythond", "sessions", name),
                       ignore_errors=True)
@@ -2688,7 +2697,7 @@ def test_integration_crash_isolation():
         print("  SKIP: integration tests use AF_UNIX")
         return
 
-    sock = os.path.join(tempfile.gettempdir(), f"pythond-crash-{os.getpid()}.sock")
+    sock_dir, sock = private_unix_sock("pythond-crash-")
     env = os.environ.copy()
     env["PYTHOND_SOCK"] = sock
 
@@ -2779,6 +2788,7 @@ def test_integration_crash_isolation():
                 proc.wait(timeout=3)
         if os.path.exists(sock):
             os.unlink(sock)
+        shutil.rmtree(sock_dir, ignore_errors=True)
         shutil.rmtree(os.path.join(os.path.expanduser("~"),
                                    ".pythond", "sessions", "crash"),
                       ignore_errors=True)
@@ -2792,7 +2802,7 @@ def test_integration_ws_attach():
         print("  SKIP: integration tests use AF_UNIX")
         return
 
-    sock = os.path.join(tempfile.gettempdir(), f"pythond-attach-{os.getpid()}.sock")
+    sock_dir, sock = private_unix_sock("pythond-attach-")
     env = os.environ.copy()
     env["PYTHOND_SOCK"] = sock
 
@@ -2882,6 +2892,7 @@ def test_integration_ws_attach():
                 proc.wait(timeout=3)
         if os.path.exists(sock):
             os.unlink(sock)
+        shutil.rmtree(sock_dir, ignore_errors=True)
         shutil.rmtree(os.path.join(os.path.expanduser("~"),
                                    ".pythond", "sessions", "ptytest"),
                       ignore_errors=True)
@@ -3004,7 +3015,7 @@ def test_integration_remote_proxy():
         print("  SKIP: integration tests use AF_UNIX")
         return
 
-    sock_a = os.path.join(tempfile.gettempdir(), f"pythond-a-{os.getpid()}.sock")
+    sock_a_dir, sock_a = private_unix_sock("pythond-a-")
     port_b = 17399 + (os.getpid() % 1000)
     addr_b = f"127.0.0.1:{port_b}"
 
@@ -3090,6 +3101,7 @@ def test_integration_remote_proxy():
                 p.wait(timeout=3)
         if os.path.exists(sock_a):
             os.unlink(sock_a)
+        shutil.rmtree(sock_a_dir, ignore_errors=True)
         shutil.rmtree(os.path.join(os.path.expanduser("~"),
                                    ".pythond", "sessions", "work"),
                       ignore_errors=True)
