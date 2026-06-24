@@ -678,29 +678,41 @@ def _generate_cert() -> tuple[str, str]:
     )
     cert_pem = cert.public_bytes(serialization.Encoding.PEM)
 
-    tmp_key = key_path + ".tmp"
-    tmp_cert = cert_path + ".tmp"
-    try:
-        for fpath, data, mode in [
-            (tmp_key, key_pem, 0o600),
-            (tmp_cert, cert_pem, 0o644),
-        ]:
-            fd = os.open(fpath,
-                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                         mode)
-            try:
-                os.write(fd, data)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+    def write_temp(target_path: str, data: bytes, mode: int) -> str:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(target_path) + ".",
+            suffix=".tmp",
+            dir=d,
+        )
+        try:
             if sys.platform != "win32":
-                os.chmod(fpath, mode)
+                os.fchmod(fd, mode)
+            with os.fdopen(fd, "wb") as f:
+                fd = -1
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            return tmp_path
+        except BaseException:
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
+    tmp_key = ""
+    tmp_cert = ""
+    try:
+        tmp_key = write_temp(key_path, key_pem, 0o600)
+        tmp_cert = write_temp(cert_path, cert_pem, 0o644)
         os.replace(tmp_key, key_path)
         os.replace(tmp_cert, cert_path)
     except Exception:
         for fpath in (tmp_key, tmp_cert, key_path, cert_path):
-            with contextlib.suppress(OSError):
-                os.unlink(fpath)
+            if fpath:
+                with contextlib.suppress(OSError):
+                    os.unlink(fpath)
         raise
 
     return cert_path, key_path
@@ -1527,7 +1539,7 @@ def _dispatch(
         target = args[0] if args else None
         if target:
             with _cells_lock:
-                cell = cells.get(target)
+                cell = cells.get(target)  # lookup before evict: grace period for late polls
                 _evict_stale_cells(cells)
                 if cell is not None:
                     cell = dict(cell)
@@ -2589,6 +2601,8 @@ def _send_remote(
             if attempt == 0:
                 continue
             return {"error": "remote closed"}
+        if isinstance(resp, bytes):
+            return {"error": "unexpected binary response"}
         if isinstance(resp, str) and resp.startswith("ERR "):
             return {"error": resp[4:]}
         if cmd == "run":
@@ -2795,6 +2809,7 @@ def _handle_ls(args: list[str]) -> str:
     return "\n".join(lines) or "(no sessions)"
 
 
+# _async_src: retained until poll pops it; cleared when session is killed
 def _log_cell_launch(name: str, src: str, resp: JsonDict) -> None:
     _log_session(name, src, json.dumps(resp), error=False)
     cid = resp.get("cell_id")

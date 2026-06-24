@@ -1649,8 +1649,14 @@ def test_connection_hardening_static():
     check("invalid trusted certs are rejected",
           "invalid certificate" in trust_cert_seg and "unknown.pem" not in trust_cert_seg)
     check("cert writes are atomic",
-          "os.replace(tmp_key, key_path)" in cert_gen_seg and
-          "os.replace(tmp_cert, cert_path)" in cert_gen_seg)
+           "os.replace(tmp_key, key_path)" in cert_gen_seg and
+           "os.replace(tmp_cert, cert_path)" in cert_gen_seg)
+    check("cert generation uses unique temp files",
+          "tempfile.mkstemp" in cert_gen_seg and
+          "cert_path + \".tmp\"" not in cert_gen_seg and
+          "key_path + \".tmp\"" not in cert_gen_seg)
+    check("cert temp files are chmodded before publish",
+          "os.fchmod(fd, mode)" in cert_gen_seg)
     check("windows TLS files do not request world-writable mode",
           "0o666" not in cert_gen_seg and "0o666" not in trust_cert_seg and
           "os.open(fp_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)" in trust_cert_seg)
