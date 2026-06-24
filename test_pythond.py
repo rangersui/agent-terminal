@@ -697,6 +697,41 @@ def test_resize_dead_pty_not_ok():
             pythond.sessions.pop(name, None)
 
 
+def test_close_session_resources_idempotent_under_race():
+    section("_close_session_resources idempotent under race")
+
+    class SlowHandle:
+        def __init__(self):
+            self.count = 0
+            self.lock = threading.Lock()
+        def close(self):
+            with self.lock:
+                self.count += 1
+            time.sleep(0.1)
+
+    handle = SlowHandle()
+    session = {
+        "type": "pty",
+        "bridge": None,
+        "winpty": None,
+        "proc": None,
+        "master_fd": None,
+        "ai": handle,
+    }
+    threads = [
+        threading.Thread(target=pythond._close_session_resources,
+                         args=(session,))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    check("handle closed once", handle.count == 1, handle.count)
+    check("session marked closed", session.get("_closed") is True)
+    check("resource cleared", session.get("ai") is None)
+
+
 def test_session_dir():
     section("_session_dir")
     name = "__test_session_dir__"
@@ -1453,6 +1488,11 @@ def test_connection_hardening_static():
           "lock.acquire(timeout=3)" in kill_session_seg and
           "should_close = False" in kill_session_seg and
           "if should_close:\n            return _close_session_resources(s)" in kill_session_seg)
+    check("close_session_resources is close-once guarded",
+          "def _session_close_lock(" in src and
+          "with _session_close_lock(s):" in close_session_seg and
+          "if s.get(\"_closed\"):" in close_session_seg and
+          "def _close_session_resources_once(" in close_session_seg)
     check("send_session marks OSError unhealthy",
           "except (OSError, json.JSONDecodeError):\n                s[\"_unhealthy\"] = True" in send_session_seg)
     check("timed out command channel stays unhealthy",
@@ -2607,6 +2647,7 @@ def main():
         test_control_handler_exact_arity,
         test_disconnect_identity_guard,
         test_resize_dead_pty_not_ok,
+        test_close_session_resources_idempotent_under_race,
         test_session_dir,
         test_session_capacity_limit,
         test_log_history,

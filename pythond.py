@@ -1655,6 +1655,15 @@ def _session_lock(session: JsonDict) -> threading.Lock:
             session["_lock"] = lock
         return lock
 
+def _session_close_lock(session: JsonDict) -> threading.Lock:
+    """Return the per-session close-once lock, creating it atomically."""
+    with _session_lock_guard:
+        lock = session.get("_close_lock")
+        if lock is None:
+            lock = threading.Lock()
+            session["_close_lock"] = lock
+        return lock
+
 def _get_session(name: str) -> JsonDict | None:
     """Return a session object by name, or None if absent."""
     with _sessions_lock:
@@ -2001,6 +2010,14 @@ def kill_session_if_current(name: str, expected: JsonDict) -> bool:
 
 def _close_session_resources(s: JsonDict) -> bool:
     """Close resources for a session already removed from the session map."""
+    with _session_close_lock(s):
+        if s.get("_closed"):
+            return True
+        s["_closed"] = True
+        return _close_session_resources_once(s)
+
+def _close_session_resources_once(s: JsonDict) -> bool:
+    """Close resources for a session. Caller holds the close-once lock."""
     if s["type"] == "remote":
         ws = s.get("_ws")
         if ws:
