@@ -1691,6 +1691,11 @@ def test_connection_hardening_static():
     check("posix spawn failure closes fds and sockets",
           "except Exception:\n            for fd in (master_fd, slave_fd):" in new_session_seg and
           "for sock_obj in (ai_parent, ai_child):" in new_session_seg)
+    check("posix bridge setup failure closes worker resources",
+          "bridge = PtyBridge(" in new_session_seg and
+          "os.close(master_fd)" in new_session_seg and
+          "ai_parent.close()" in new_session_seg and
+          "p.terminate()" in new_session_seg)
     check("PTY bridge writes all bytes",
           "lambda d: _write_all(master_fd, d)" in new_session_seg)
     check("kill closes PTY bridge",
@@ -2810,6 +2815,39 @@ def test_unit_pty_bridge():
     check("scrollback flushed", len(received) > 0)
     check("scrollback content", b"scrollback data" in b"".join(received),
           b"".join(received))
+
+    bridge.detach(owner)
+    received.clear()
+    os.write(w_fd, b"old scrollback\n")
+    time.sleep(0.2)
+    release_scrollback = threading.Event()
+    flush_done = threading.Event()
+
+    def blocking_send(data):
+        received.append(data)
+        if data == b"old scrollback\n":
+            os.write(w_fd, b"new live\n")
+            time.sleep(0.2)
+            release_scrollback.wait(timeout=3)
+
+    owner = bridge.attach(blocking_send)
+    check("ordered attach accepted", owner is not None)
+    t = threading.Thread(
+        target=lambda: (
+            bridge.flush_scrollback(owner),
+            flush_done.set(),
+        ),
+        daemon=True,
+    )
+    t.start()
+    time.sleep(0.3)
+    check("live output waits for scrollback flush", received == [b"old scrollback\n"],
+          received)
+    release_scrollback.set()
+    flush_done.wait(timeout=3)
+    time.sleep(0.3)
+    check("scrollback delivered before live output",
+          received[:2] == [b"old scrollback\n", b"new live\n"], received)
 
     # new data after attach -> goes to client directly
     received.clear()

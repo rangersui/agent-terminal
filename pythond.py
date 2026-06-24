@@ -1785,18 +1785,24 @@ class PtyBridge:
 
     def flush_scrollback(self, owner: object) -> bool:
         """Enable an attached client and flush buffered output after attach ack."""
-        scrollback = b""
         send_fn = None
         with self._lock:
             if self._owner is not owner or self._pending_send_fn is None:
                 return False
             send_fn = self._pending_send_fn
-            self._send_fn = send_fn
             self._pending_send_fn = None
-            if self._scrollback:
-                scrollback = bytes(self._scrollback)
-                self._scrollback.clear()
-        if scrollback:
+
+        while True:
+            scrollback = b""
+            with self._lock:
+                if self._owner is not owner:
+                    return False
+                if self._scrollback:
+                    scrollback = bytes(self._scrollback)
+                    self._scrollback.clear()
+                else:
+                    self._send_fn = send_fn
+                    return True
             try:
                 send_fn(scrollback)
             except Exception:
@@ -1807,7 +1813,6 @@ class PtyBridge:
                         close_fn = self._take_close_fn_locked(owner)
                 self._call_close_fn(close_fn)
                 return False
-        return True
 
     def _take_close_fn_locked(
         self,
@@ -1992,12 +1997,21 @@ def new_session(name: str) -> None:
             raise
         os.close(slave_fd)
         ai_child.close()
+        try:
+            bridge = PtyBridge(
+                lambda: os.read(master_fd, 4096),
+                lambda d: _write_all(master_fd, d))
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+            with contextlib.suppress(OSError):
+                ai_parent.close()
+            with contextlib.suppress(Exception):
+                p.terminate()
+            raise
         session = {
             "type": "pty", "proc": p, "master_fd": master_fd,
-            "ai": ai_parent,
-            "bridge": PtyBridge(
-                lambda: os.read(master_fd, 4096),
-                lambda d: _write_all(master_fd, d)),
+            "ai": ai_parent, "bridge": bridge,
         }
         try:
             _set_session(name, session)
