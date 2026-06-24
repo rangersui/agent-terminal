@@ -852,6 +852,18 @@ def test_wspro_client_basic():
     check("wsproto close writes and closes", sock.closed and len(sock.sent) > 0)
 
 
+def test_wspro_client_preserves_batched_frames():
+    section("WsproClient batched frames")
+    client_ws, server_ws = _accepted_ws_pair()
+    payload = (
+        server_ws.send(pythond.ws_events.TextMessage(data="first")) +
+        server_ws.send(pythond.ws_events.TextMessage(data="second"))
+    )
+    client = pythond._WsproClient(_FakeWsSock(payload), client_ws)
+    check("first batched frame delivered", client.recv(timeout=1) == "first")
+    check("second batched frame delivered", client.recv(timeout=1) == "second")
+
+
 def test_wspro_client_payload_limit():
     section("WsproClient payload limit")
     client_ws, server_ws = _accepted_ws_pair()
@@ -890,9 +902,9 @@ def test_tls_and_auth_hardening_static():
           "def _utc_timestamp_ms(" in src and
           "time.time_ns()" in src and
           "conn_id" in access_log_seg)
-    check("access log fchmod only on create",
-          "created = not os.path.exists(path)" in access_log_seg and
-          "if created and sys.platform != \"win32\":" in access_log_seg)
+    check("access log fchmods unconditionally",
+          "created = not os.path.exists(path)" not in access_log_seg and
+          "if sys.platform != \"win32\":\n                os.fchmod(fd, 0o600)" in access_log_seg)
     check("access log mirrors to stderr",
           "_ACCESS_STDERR_QUEUE.put_nowait(line)" in access_mirror_seg and
           "threading.Thread(target=_access_stderr_worker, daemon=True)" in access_mirror_seg and
@@ -941,6 +953,9 @@ def test_connection_hardening_static():
     attach_reader_seg = src[src.index("def _attach_reader("):src.index("def _attach_ws_loop(")]
     attach_loop_seg = src[src.index("def _attach_ws_loop("):src.index("def _attach_ws_pty(")]
     attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _worker_entry(")]
+    eval_exec_seg = src[src.index("def _eval_exec_cell("):src.index("def _make_exec(")]
+    handle_new_seg = src[src.index("def _handle_new("):src.index("def _handle_int(")]
+    handle_ls_seg = src[src.index("def _handle_ls("):src.index("def _log_cell_launch(")]
     connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
     add_session_subparsers_seg = src[src.index("def _add_session_subparsers("):src.index("def main(")]
     client_start = src.index("def client(")
@@ -971,6 +986,7 @@ def test_connection_hardening_static():
           "attach requires a TTY" in attach_pty_seg)
     check("attach sends resize on same connection",
           "_send(\"resize\"" not in attach_seg and
+          "cols, rows = os.get_terminal_size()" in attach_seg and
           "attach {name}{resize_args}" in attach_seg and
           "_handle_resize([aname, args[1], args[2]])" in daemon_seg)
     check("attach errors use public message",
@@ -1001,6 +1017,10 @@ def test_connection_hardening_static():
     check("wsproto timeout clears partial message",
           "except (TimeoutError, socket.timeout):" in wspro_seg and
           "self._clear_message()" in wspro_seg)
+    check("wsproto preserves pending events",
+          "collections.deque" in wspro_seg and
+          "while self._pending_events:" in wspro_seg and
+          "self._pending_events.extend(events[i + 1:])" in wspro_seg)
     check("wsproto pong write is guarded",
           "ws_events.Pong" in wspro_seg and
           "except (OSError, LocalProtocolError):" in wspro_seg)
@@ -1029,8 +1049,9 @@ def test_connection_hardening_static():
           "subprocess.TimeoutExpired" in src and "def _secure_path_win32" in src)
     check("windows path hardening fails closed",
           "raise RuntimeError(f\"cannot secure directory: {path}\")" in secure_win_seg)
-    check("log files are created private",
-          "os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT" in log_seg and
+    check("log files are private and nofollow",
+          "os.open(path, flags" in log_seg and
+          "O_NOFOLLOW" in log_seg and
           "0o600" in log_seg)
     check("trusted cert dirs use private helper",
           "_ensure_private_dir" in cert_dirs_seg and "os.makedirs" not in cert_dirs_seg)
@@ -1042,6 +1063,10 @@ def test_connection_hardening_static():
     check("cert cache validates key pair",
           "_cert_key_pair_valid(cert_path, key_path)" in cert_gen_seg and
           "TLS cert/key mismatch; regenerating" in cert_gen_seg)
+    check("cert key validation tolerates missing crypto",
+          "except (AttributeError, NameError, OSError, TypeError, ValueError):" in cert_gen_seg)
+    check("trusted cert load skips unreadable certs",
+          "except (_ssl.SSLError, OSError):" in src)
     check("cert partial replace is invalidated",
           "for fpath in (tmp_key, tmp_cert, key_path, cert_path):" in cert_gen_seg)
     check("self-signed cert is not a CA",
@@ -1108,6 +1133,12 @@ def test_connection_hardening_static():
           "with _cells_lock:\n            t.start()" in dispatch_seg and
           "res[\"tid\"] = t.ident" in dispatch_seg and
           "cells[cid] = res" in dispatch_seg)
+    check("fire result publication is locked",
+          "with _cells_lock:\n                    r[\"output\"] = output" in dispatch_seg and
+          "r[\"status\"] = \"done\"" in dispatch_seg)
+    check("eval exec auto-prints any expression tail",
+          "if isinstance(last, _ast.Expr):" in eval_exec_seg and
+          "len(tree.body) > 1" not in eval_exec_seg)
     check("latest poll uses explicit cell sequence",
           "\"_seq\": next(_CELL_SEQ)" in dispatch_seg and
           "list(cells)[-1]" not in dispatch_seg)
@@ -1125,6 +1156,13 @@ def test_connection_hardening_static():
           "winpty = s.get(\"winpty\")" in monitor_seg and
           "proc = s.get(\"proc\")" in monitor_seg and
           "s[\"proc\"].wait()" not in monitor_seg)
+    check("handle_new tolerates cleared process handles",
+          "winpty = s.get(\"winpty\")" in handle_new_seg and
+          "proc = s.get(\"proc\")" in handle_new_seg)
+    check("handle_ls tolerates cleared process handles",
+          "winpty = s.get(\"winpty\")" in handle_ls_seg and
+          "proc = s.get(\"proc\")" in handle_ls_seg and
+          "DEAD (pty)" in handle_ls_seg)
     check("session command path avoids timeout-sensitive makefile",
           "makefile" not in send_session_seg and
           "_recv_session_line" in src)
@@ -1132,7 +1170,10 @@ def test_connection_hardening_static():
           "finally:\n        s[\"_ai_buf\"] = buf" in recv_line_seg)
     check("kill_session has lock timeout",
           "lock.acquire(timeout=3)" in kill_session_seg and
-          "_close_session_resources(s)" in kill_session_seg)
+          "should_close = False" in kill_session_seg and
+          "if should_close:\n            return _close_session_resources(s)" in kill_session_seg)
+    check("send_session marks OSError unhealthy",
+          "except (OSError, json.JSONDecodeError):\n                s[\"_unhealthy\"] = True" in send_session_seg)
     check("timed out command channel stays unhealthy",
           "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
     check("remote does not retry after send",
@@ -1142,6 +1183,9 @@ def test_connection_hardening_static():
     check("connect_remote does not kill before network IO",
           "kill_session(name)" not in connect_remote_seg and
           "_set_session(name" in connect_remote_seg)
+    check("connect_remote rejects close during probe",
+          "if resp is _WS_CLOSE:" in connect_remote_seg and
+          "remote closed during probe" in connect_remote_seg)
     pre_host_seg = connect_daemon_seg.split("host = os.environ.get(\"PYTHOND_HOST\")", 1)[0]
     check("daemon connector delays websockets import",
           "from websockets.sync.client import unix_connect" not in pre_host_seg and
@@ -1179,6 +1223,9 @@ def test_connection_hardening_static():
           "except (TimeoutError, socket.timeout):" in attach_reader_seg)
     check("attach reader surfaces text errors",
           "print(frame, file=sys.stderr)" in attach_reader_seg)
+    check("attach reader exact detached sentinel",
+          "if frame == \"OK detached\":" in attach_reader_seg and
+          "\"detached\" in frame" not in attach_reader_seg)
     check("attach preserves bytes before Ctrl-]",
           "data.partition(b\"\\x1d\")" in attach_loop_seg and
           "ws.send(before)" in attach_loop_seg)
@@ -1194,7 +1241,11 @@ def test_connection_hardening_static():
           "attach requires a TTY" in attach_win_seg)
     check("windows attach consumes extended key bytes together",
           "first in (b\"\\x00\", b\"\\xe0\")" in attach_win_seg and
-          "return first + msvcrt.getch()" in attach_win_seg)
+          "return first + msvcrt.getch()" in attach_win_seg and
+          "while not stopped.is_set() and not msvcrt.kbhit():" in attach_win_seg)
+    check("windows attach checks console mode calls",
+          "if not kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in)):" in attach_win_seg and
+          "if not kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out)):" in attach_win_seg)
     check("windows attach clears line and echo input",
           "& ~0x0007" in attach_win_seg)
     check("client prints ERR to stderr",
@@ -2163,6 +2214,7 @@ def main():
         test_send_remote_transparent_alias,
         test_session_command_arg_normalization,
         test_wspro_client_basic,
+        test_wspro_client_preserves_batched_frames,
         test_wspro_client_payload_limit,
         test_tls_and_auth_hardening_static,
         test_connection_hardening_static,

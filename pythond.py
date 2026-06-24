@@ -117,6 +117,7 @@ from __future__ import annotations
 
 import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile, code
 import argparse
+import collections
 import select
 import signal, subprocess
 import pickle
@@ -312,11 +313,10 @@ def _access_log(
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        created = not os.path.exists(path)
         fd = os.open(path, flags, 0o600) if sys.platform != "win32" else os.open(path, flags)
         try:
             os.write(fd, line.encode("utf-8", "replace"))
-            if created and sys.platform != "win32":
+            if sys.platform != "win32":
                 os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
@@ -356,8 +356,10 @@ def _log_history(name: str, src: str) -> None:
     """Append successful exec source to history.py (replayable)."""
     try:
         path = os.path.join(_session_dir(name), "history.py")
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-                     0o600 if sys.platform != "win32" else 0o666)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600 if sys.platform != "win32" else 0o666)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}]\n{src}\n")
     except OSError as e:
@@ -367,8 +369,10 @@ def _log_session(name: str, src: str, output: str = "", error: bool = False) -> 
     """Append all exec activity to session.log (human readable)."""
     try:
         path = os.path.join(_session_dir(name), "session.log")
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-                     0o600 if sys.platform != "win32" else 0o666)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600 if sys.platform != "win32" else 0o666)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             tag = "ERROR" if error else "OK"
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}] {tag}\n")
@@ -448,7 +452,6 @@ def _tcp_daemon_alive(meta: JsonDict) -> bool:
                         subprotocols=[_WS_PROTO])
         ws.send("ls")
         resp = ws.recv(timeout=2)
-        ws.close()
         return resp != "ERR auth failed"
     except Exception:
         return False
@@ -671,7 +674,7 @@ def _cert_key_pair_valid(cert_path: str, key_path: str) -> bool:
         cert_public = typing.cast(typing.Any, cert.public_key())
         key_public = typing.cast(typing.Any, key.public_key())
         return cert_public.public_numbers() == key_public.public_numbers()
-    except (AttributeError, OSError, TypeError, ValueError):
+    except (AttributeError, NameError, OSError, TypeError, ValueError):
         return False
 
 def _cert_fingerprint(cert_path: str) -> str:
@@ -700,7 +703,7 @@ def _load_trusted_certs(ssl_ctx: _ssl.SSLContext, directory: str) -> int:
             try:
                 ssl_ctx.load_verify_locations(os.path.join(directory, f))
                 count += 1
-            except _ssl.SSLError:
+            except (_ssl.SSLError, OSError):
                 print(f"warn: skipping malformed cert {f}", file=sys.stderr)
     return count
 
@@ -935,7 +938,7 @@ def _eval_exec_cell(src: str, ns: JsonDict) -> None:
         pass
     tree = _ast.parse(src, "<cell>")
     last = tree.body[-1] if tree.body else None
-    if isinstance(last, _ast.Expr) and len(tree.body) > 1:
+    if isinstance(last, _ast.Expr):
         stmts = _ast.Module(body=tree.body[:-1], type_ignores=[])
         _ast.fix_missing_locations(stmts)
         exec(compile(stmts, "<cell>", "exec"), ns)
@@ -1067,15 +1070,18 @@ def _dispatch(
         def _bg(c: str = args[0], r: JsonDict = res) -> None:
             try:
                 out = _exec(c)
-                r["output"] = str(out)
-                r["_error"] = bool(getattr(out, "error", False))
+                output = str(out)
+                error = bool(getattr(out, "error", False))
             except BaseException:
-                r["output"] = traceback.format_exc().rstrip()
-                r["_error"] = True
+                output = traceback.format_exc().rstrip()
+                error = True
             finally:
-                r["status"] = "done"
-                r["_done_at"] = time.time()
-                r["tid"] = None
+                with _cells_lock:
+                    r["output"] = output
+                    r["_error"] = error
+                    r["status"] = "done"
+                    r["_done_at"] = time.time()
+                    r["tid"] = None
         t = threading.Thread(target=_bg, daemon=True)
         with _cells_lock:
             t.start()
@@ -1699,10 +1705,14 @@ def kill_session(name: str) -> bool:
     lock = _session_lock(s)
     locked = lock.acquire(timeout=3)
     if not locked:
+        should_close = False
         with _sessions_lock:
             if sessions.get(name) is s:
                 sessions.pop(name, None)
-        return _close_session_resources(s)
+                should_close = True
+        if should_close:
+            return _close_session_resources(s)
+        return False
     try:
         with _sessions_lock:
             if sessions.get(name) is not s:
@@ -1862,6 +1872,7 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
                 return {"error": "timeout -- command channel may be out of sync; "
                         "use pysh int or pysh kill if stuck"}
             except (OSError, json.JSONDecodeError):
+                s["_unhealthy"] = True
                 return {"error": "session command failed"}
             finally:
                 try:
@@ -1916,6 +1927,7 @@ class _WsproClient:
         self.ws = ws
         self._text_parts: list[str] = []
         self._bytes_parts: list[bytes] = []
+        self._pending_events: collections.deque[ws_events.Event] = collections.deque()
         self._message_size = 0
 
     @classmethod
@@ -1980,13 +1992,19 @@ class _WsproClient:
             self.sock.settimeout(timeout)
         try:
             while True:
+                while self._pending_events:
+                    result = self._handle_event(self._pending_events.popleft())
+                    if result is not None:
+                        return result
                 data = self.sock.recv(_BUFFER_CHUNK)
                 if not data:
                     raise RuntimeError("websocket closed")
                 self.ws.receive_data(data)
-                for event in self.ws.events():
+                events = list(self.ws.events())
+                for i, event in enumerate(events):
                     result = self._handle_event(event)
                     if result is not None:
+                        self._pending_events.extend(events[i + 1:])
                         return result
         except (TimeoutError, socket.timeout):
             self._clear_message()
@@ -2234,6 +2252,8 @@ def connect_remote(
         ws = _open_remote_ws(host, port, token, use_tls=use_tls, timeout=10)
         ws.send("ls")
         resp = ws.recv(timeout=5)
+        if resp is _WS_CLOSE:
+            return "ERR remote closed during probe"
         if resp == "ERR auth failed":
             return "ERR auth failed on remote"
     except Exception as e:
@@ -2309,9 +2329,13 @@ def _handle_new(args: list[str]) -> str:
     s = _get_session(name)
     if s is None:
         return f"ERR failed to create session '{name}'"
-    if "winpty" in s:
-        return f"OK {name} pid={s['winpty'].pid} (winpty)"
-    return f"OK {name} pid={s['proc'].pid}"
+    winpty = s.get("winpty")
+    proc = s.get("proc")
+    if winpty is not None:
+        return f"OK {name} pid={winpty.pid} (winpty)"
+    if proc is not None:
+        return f"OK {name} pid={proc.pid}"
+    return f"ERR failed to create session '{name}'"
 
 
 def _handle_int(args: list[str]) -> str:
@@ -2385,12 +2409,16 @@ def _handle_ls(args: list[str]) -> str:
             tls_tag = " tls" if s.get("tls") else ""
             lines.append(f"  {n}: -> {s['host']}:{s['port']}{tls_tag} (remote)")
         elif s["type"] == "pty":
-            if "winpty" in s:
-                alive = "alive" if s["winpty"].isalive() else "DEAD"
+            winpty = s.get("winpty")
+            proc = s.get("proc")
+            if winpty is not None:
+                alive = "alive" if winpty.isalive() else "DEAD"
                 lines.append(f"  {n}: {alive} (winpty)")
+            elif proc is not None:
+                alive = "DEAD" if proc.poll() is not None else "alive"
+                lines.append(f"  {n}: {alive} pid={proc.pid} (pty)")
             else:
-                alive = "DEAD" if s["proc"].poll() is not None else "alive"
-                lines.append(f"  {n}: {alive} pid={s['proc'].pid} (pty)")
+                lines.append(f"  {n}: DEAD (pty)")
     return "\n".join(lines) or "(no sessions)"
 
 
@@ -2839,7 +2867,7 @@ def attach(name: str) -> bool:
     # request attach
     resize_args = ""
     try:
-        rows, cols = os.get_terminal_size()
+        cols, rows = os.get_terminal_size()
         resize_args = f" {rows} {cols}"
     except OSError:
         pass  # non-interactive or detached terminal -- attach can still try
@@ -2893,7 +2921,7 @@ def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
             if isinstance(frame, bytes):
                 os.write(sys.stdout.fileno(), frame)
             elif isinstance(frame, str):
-                if "detached" in frame:
+                if frame == "OK detached":
                     break
                 print(frame, file=sys.stderr)
     except Exception as e:
@@ -2906,7 +2934,7 @@ def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
 def _attach_ws_loop(
     ws: WebSocketLike,
     name: str,
-    read_input: typing.Callable[[], bytes | None],
+    read_input: typing.Callable[[threading.Event], bytes | None],
     restore_terminal: typing.Callable[[], None],
 ) -> None:
     """Shared attach loop. read_input returns bytes, None, or b'' for EOF."""
@@ -2919,7 +2947,7 @@ def _attach_ws_loop(
                              daemon=True)
         t.start()
         while not stopped.is_set():
-            data = read_input()
+            data = read_input(stopped)
             if data is None:
                 continue
             if not data or b"\x1d" in data:  # Ctrl-]
@@ -2957,7 +2985,7 @@ def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> None:
     old = termios.tcgetattr(sys.stdin)  # type: ignore[name-defined]
     tty.setraw(sys.stdin)  # type: ignore[name-defined]
 
-    def read_input() -> bytes | None:
+    def read_input(_stopped: threading.Event) -> bytes | None:
         r, _, _ = _sel.select([sys.stdin], [], [], 0.1)  # type: ignore[name-defined]
         if sys.stdin not in r:
             return None
@@ -2990,8 +3018,10 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
     stdout_h = kernel32.GetStdHandle(-11)
     old_in = ctypes.c_uint32()
     old_out = ctypes.c_uint32()
-    kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in))
-    kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out))
+    if not kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in)):
+        raise RuntimeError("GetConsoleMode failed")
+    if not kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out)):
+        raise RuntimeError("GetConsoleMode failed")
     kernel32.SetConsoleMode(
         stdin_h,
         (old_in.value & ~0x0007) | _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT,
@@ -3002,14 +3032,16 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
         _WIN_ENABLE_WRAP_AT_EOL_OUTPUT | _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     )
 
-    def read_input() -> bytes | None:
+    def read_input(stopped: threading.Event) -> bytes | None:
         if not msvcrt.kbhit():
             time.sleep(0.01)
             return None
         first = msvcrt.getch()
         if first in (b"\x00", b"\xe0"):
-            while not msvcrt.kbhit():
+            while not stopped.is_set() and not msvcrt.kbhit():
                 time.sleep(0.01)
+            if stopped.is_set():
+                return None
             return first + msvcrt.getch()
         return first
 
