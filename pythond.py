@@ -109,6 +109,7 @@ fire vs fork:
     is risky; use fork early or kill/recreate the session if it wedges.
 """
 import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile, code
+import argparse
 import select
 import signal, subprocess
 import multiprocessing as mp
@@ -138,6 +139,7 @@ _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1
 _MAX_TLS_BRIDGE_THREADS = int(os.environ.get("PYTHOND_MAX_TLS_BRIDGE_THREADS", "256"))
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _BUFFER_CHUNK = 64 * 1024
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _ASYNC_CELL_TTL = 300
 _ATTACH_READ_SIZE = 1024
 _WIN_ENABLE_PROCESSED_INPUT = 0x0001
@@ -211,6 +213,9 @@ def _ensure_private_dir(path: str) -> str:
     created = not os.path.isdir(path)
     os.makedirs(path, exist_ok=True)
     if sys.platform == "win32":
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attrs != 0xFFFFFFFF and attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError(f"insecure directory: reparse point: {path}")
         _secure_path_win32(path)
     else:
         st = os.lstat(path)
@@ -280,7 +285,8 @@ def _secure_path_win32(path: str) -> None:
             "/grant:r", "SYSTEM:(OI)(CI)(F)",         # SYSTEM = full
             "/grant:r", "BUILTIN\\Administrators:(OI)(CI)(F)",
         ], check=True, capture_output=True, timeout=10)
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
         # icacls not available (shouldn't happen on Win10+)
         # fall back to user-level: at least restrict via token auth
         pass
@@ -683,7 +689,10 @@ class _TlsTerminatedServer:
         while not self._stopped.is_set():
             try:
                 readable = [tls_sock] if tls_sock.pending() else []
-                if not readable:
+                if readable:
+                    inner_readable, _, _ = select.select([inner_sock], [], [], 0)
+                    readable.extend(inner_readable)
+                else:
                     readable, _, _ = select.select(list(peers), [], [], 1.0)
             except (OSError, ValueError):
                 return
@@ -917,8 +926,8 @@ def _dispatch(
                 r["_done_at"] = time.time()
                 r["tid"] = None
         t = threading.Thread(target=_bg, daemon=True)
-        t.start()
         with _cells_lock:
+            t.start()
             if res["status"] == "running":
                 res["tid"] = t.ident
             cells[cid] = res
@@ -1324,9 +1333,13 @@ def _get_session(name: str) -> JsonDict | None:
 def _set_session(name: str, session: JsonDict) -> None:
     """Publish a newly created session atomically."""
     _validate_session_name(name)
+    old_session = None
     with _sessions_lock:
         _check_session_capacity_locked(name)
+        old_session = sessions.get(name)
         sessions[name] = session
+    if old_session is not None and old_session is not session:
+        _close_session_resources(old_session)
 
 def _ensure_session_capacity(name: str) -> None:
     """Fail before allocating worker resources when no new session slot exists."""
@@ -1444,6 +1457,7 @@ def new_session(name: str) -> None:
         kill_session(name)
     if _HAS_PTY and _WinPty is not None:
         ai_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proc = None
         try:
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                 ai_srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
@@ -1466,13 +1480,17 @@ def new_session(name: str) -> None:
                         os.environ[_WORKER_ENV] = old_worker_env
             ai_conn, _ = ai_srv.accept()
         except socket.timeout:
-            try:
+            if proc is not None:
                 proc.terminate(force=True)
-            except UnboundLocalError:
-                pass
             raise RuntimeError("winpty worker failed to connect")
+        except BaseException:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.terminate(force=True)
+            raise
         finally:
             ai_srv.close()
+        assert proc is not None
         def _read() -> bytes:
             try:
                 return proc.read().encode()
@@ -1543,12 +1561,21 @@ def kill_session(name: str) -> bool:
         s = sessions.get(name)
     if s is None:
         return False
-    with _session_lock(s):
+    lock = _session_lock(s)
+    locked = lock.acquire(timeout=3)
+    if not locked:
+        with _sessions_lock:
+            if sessions.get(name) is s:
+                sessions.pop(name, None)
+        return _close_session_resources(s)
+    try:
         with _sessions_lock:
             if sessions.get(name) is not s:
                 return False
             sessions.pop(name, None)
         return _close_session_resources(s)
+    finally:
+        lock.release()
 
 def _close_session_resources(s: JsonDict) -> bool:
     """Close resources for a session already removed from the session map."""
@@ -1650,15 +1677,16 @@ def _monitor_session(name: str) -> None:
 def _recv_session_line(s: JsonDict) -> str | None:
     """Read one newline-delimited JSON response from the worker socket."""
     buf = typing.cast(bytes, s.get("_ai_buf", b""))
-    while b"\n" not in buf:
-        chunk = s["ai"].recv(_BUFFER_CHUNK)
-        if not chunk:
-            s["_ai_buf"] = buf
-            return None
-        buf += chunk
-    line, rest = buf.split(b"\n", 1)
-    s["_ai_buf"] = rest
-    return line.decode("utf-8", "replace")
+    try:
+        while b"\n" not in buf:
+            chunk = s["ai"].recv(_BUFFER_CHUNK)
+            if not chunk:
+                return None
+            buf += chunk
+        line, buf = buf.split(b"\n", 1)
+        return line.decode("utf-8", "replace")
+    finally:
+        s["_ai_buf"] = buf
 
 def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
     """Send one AI command to a session and wait for its response.
@@ -1766,6 +1794,7 @@ class _WsproClient:
         timeout: float = 10,
     ) -> "_WsproClient":
         raw = socket.create_connection((host, port), timeout=timeout)
+        sock = None
         try:
             sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
             sock.settimeout(timeout)
@@ -1796,7 +1825,10 @@ class _WsproClient:
                     if isinstance(event, ws_events.RejectData):
                         raise RuntimeError("websocket rejected")
         except Exception:
-            raw.close()
+            if sock is not None:
+                sock.close()
+            else:
+                raw.close()
             raise
 
     def send(self, data: str | bytes) -> None:
@@ -1912,6 +1944,8 @@ def _parse_host_port(value: str, default_port: int = 7399) -> tuple[str, int]:
     else:
         host = value
         port = int(os.environ.get("PYTHOND_PORT", str(default_port)))
+    if not host:
+        raise ValueError("host required")
     if not (1 <= port <= 65535):
         raise ValueError("port out of range")
     return host, port
@@ -1958,6 +1992,8 @@ def _connect_daemon(timeout: float = 5) -> WebSocketLike:
 
     meta = _read_daemon_meta()
     port = int(os.environ.get("PYTHOND_PORT") or meta.get("port") or "7399")
+    if not (1 <= port <= 65535):
+        raise ValueError("port out of range")
     token = token or meta.get("token", "")
     return _open_remote_ws("127.0.0.1", port, token, use_tls=False,
                            timeout=timeout)
@@ -2052,8 +2088,6 @@ def connect_remote(
         _ensure_session_capacity(name)
     except (ValueError, RuntimeError) as e:
         return f"ERR {_public_error(e)}"
-    if _get_session(name) is not None:
-        kill_session(name)
     # test connectivity + auth now; actual data goes through _send_remote
     # which reconnects lazily.  This test catches bad host/port/token early
     # but doesn't guarantee future requests succeed (network can change).
@@ -2675,8 +2709,10 @@ def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
                 break
             if isinstance(frame, bytes):
                 os.write(sys.stdout.fileno(), frame)
-            elif isinstance(frame, str) and "detached" in frame:
-                break
+            elif isinstance(frame, str):
+                if "detached" in frame:
+                    break
+                print(frame, file=sys.stderr)
     except Exception:
         pass  # connection closing -- send/close may fail
     stopped.set()
@@ -2692,6 +2728,7 @@ def _attach_ws_loop(
     if name:
         print(f"attached to {name} (Ctrl-] to detach)", file=sys.stderr)
     stopped = threading.Event()
+    t: threading.Thread | None = None
     try:
         t = threading.Thread(target=_attach_reader, args=(ws, stopped),
                              daemon=True)
@@ -2714,6 +2751,8 @@ def _attach_ws_loop(
         pass  # user interrupted -- normal exit
     finally:
         stopped.set()
+        if t is not None:
+            t.join(timeout=3)
         restore_terminal()
         try:
             ws.send("detach")
@@ -2783,7 +2822,12 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
         if not msvcrt.kbhit():
             time.sleep(0.01)
             return None
-        return msvcrt.getch()
+        first = msvcrt.getch()
+        if first in (b"\x00", b"\xe0"):
+            while not msvcrt.kbhit():
+                time.sleep(0.01)
+            return first + msvcrt.getch()
+        return first
 
     def restore_terminal() -> None:
         kernel32.SetConsoleMode(stdin_h, old_in.value)
@@ -2827,13 +2871,7 @@ def _worker_entry(argv: list[str]) -> bool:
 def main() -> None:
     """Entry point for `pythond` command -- full command set."""
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__.encode(sys.stdout.encoding or "utf-8", "replace").decode(sys.stdout.encoding or "utf-8", "replace"))
-        sys.exit(0)
-    if argv[0] in ("--version", "-V", "version"):
-        print(f"pythond {__version__}")
-        sys.exit(0)
-    if argv[0].startswith("_worker"):
+    if argv and argv[0].startswith("_worker"):
         if os.environ.get(_WORKER_ENV) != "1":
             print("ERR internal worker entry point", file=sys.stderr)
             sys.exit(1)
@@ -2841,143 +2879,200 @@ def main() -> None:
             print(f"ERR unknown worker command: {argv[0]}", file=sys.stderr)
             sys.exit(1)
         return
-    if argv[0] == "daemon":
+
+    parser = argparse.ArgumentParser(
+        prog="pythond",
+        description="Persistent Python REPL daemon.",
+        epilog="Use pysh for session commands and pyctl for daemon management.",
+    )
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"pythond {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    p_daemon = sub.add_parser("daemon", help="start daemon in foreground")
+    p_daemon.add_argument("--listen", metavar="HOST:PORT",
+                          help="listen address")
+    p_daemon.add_argument("--tls", action="store_true",
+                          help="enable TLS")
+    p_daemon.add_argument("--show-token", action="store_true",
+                          help="print auth token")
+
+    p_attach = sub.add_parser("attach", help="attach terminal to session")
+    p_attach.add_argument("name", nargs="?", default="default")
+
+    p_new = sub.add_parser("new", help="create session")
+    p_new.add_argument("name")
+    for cname, chelp in (
+        ("run", "sync exec, raw output"),
+        ("fire", "async thread exec"),
+        ("fork", "async process exec"),
+    ):
+        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd.add_argument("name")
+        p_cmd.add_argument("code")
+    p_poll = sub.add_parser("poll", help="check async result")
+    p_poll.add_argument("name")
+    p_poll.add_argument("cell_id", nargs="?")
+    for cname, chelp in (
+        ("int", "interrupt running cells"),
+        ("kill", "terminate session"),
+        ("status", "session health"),
+        ("vars", "namespace names"),
+    ):
+        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd.add_argument("name")
+    sub.add_parser("ls", help="list sessions")
+    p_complete = sub.add_parser("complete", help="tab completions")
+    p_complete.add_argument("name")
+    p_complete.add_argument("text")
+
+    if not argv:
+        parser.print_help()
+        sys.exit(0)
+    if argv[0] == "version":
+        print(f"pythond {__version__}")
+        sys.exit(0)
+
+    args = parser.parse_args(argv)
+    if args.command == "daemon":
         _mp_init()
-        show = "--show-token" in argv
-        listen = None
-        use_tls = "--tls" in argv
-        for i, a in enumerate(argv):
-            if a == "--listen" and i + 1 < len(argv):
-                listen = argv[i + 1]
-            elif a == "--listen":
-                print("ERR --listen requires HOST:PORT", file=sys.stderr)
-                sys.exit(1)
-        daemon(show_token=show, listen_addr=listen, tls=use_tls)
-    elif argv[0] == "attach":
-        name = argv[1] if len(argv) > 1 else "default"
-        if not attach(name):
+        daemon(show_token=args.show_token, listen_addr=args.listen,
+               tls=args.tls)
+    elif args.command == "attach":
+        if not attach(args.name):
             sys.exit(1)
     else:
-        client(argv[0], argv[1:])
-
-_PYSH_HELP = """\
-pysh -- Python Shell. Client for pythond daemon.
-
-  pysh run <name> "code"       sync exec, raw output
-  pysh fire <name> "code"      async (thread) -- shares namespace, can't kill C
-  pysh fork <name> "code"      async process (POSIX only) -- killable, pickles back
-  pysh poll <name> [cell_id]   check async result
-  pysh attach <name>           human REPL (Ctrl-] detach)
-  pysh new <name>              create session
-  pysh int <name>              best-effort interrupt (fire=best effort, fork=kill)
-  pysh kill <name>             terminate session
-  pysh ls                      list sessions
-  pysh status <name>           session health (JSON)
-  pysh vars <name>             namespace names (JSON)
-  pysh complete <name> "text"  tab completions (JSON)
-  pysh --version               print version
-
-Remote sessions are managed by pyctl (connect/disconnect).
-Once connected, pysh run/fire/fork/poll work transparently.
-"""
+        client(args.command, argv[1:])
 
 def pysh_main() -> None:
     """Entry point for `pysh` command -- session commands."""
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
-        print(_PYSH_HELP)
+    parser = argparse.ArgumentParser(
+        prog="pysh",
+        description="Python Shell: client for pythond daemon.",
+        epilog="Remote sessions are managed by pyctl connect/disconnect.",
+    )
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"pythond {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    p_attach = sub.add_parser("attach", help="attach terminal to session")
+    p_attach.add_argument("name", nargs="?", default="default")
+    p_new = sub.add_parser("new", help="create session")
+    p_new.add_argument("name")
+    for cname, chelp in (
+        ("run", "sync exec, raw output"),
+        ("fire", "async thread exec"),
+        ("fork", "async process exec"),
+    ):
+        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd.add_argument("name")
+        p_cmd.add_argument("code")
+    p_poll = sub.add_parser("poll", help="check async result")
+    p_poll.add_argument("name")
+    p_poll.add_argument("cell_id", nargs="?")
+    for cname, chelp in (
+        ("int", "interrupt running cells"),
+        ("kill", "terminate session"),
+        ("status", "session health"),
+        ("vars", "namespace names"),
+    ):
+        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd.add_argument("name")
+    sub.add_parser("ls", help="list sessions")
+    p_complete = sub.add_parser("complete", help="tab completions")
+    p_complete.add_argument("name")
+    p_complete.add_argument("text")
+
+    if not argv:
+        parser.print_help()
         sys.exit(0)
-    if argv[0] in ("--version", "-V", "version"):
+    if argv[0] == "version":
         print(f"pythond {__version__}")
         sys.exit(0)
-    if argv[0] == "attach":
-        name = argv[1] if len(argv) > 1 else "default"
-        if not attach(name):
+
+    args = parser.parse_args(argv)
+    if args.command == "attach":
+        if not attach(args.name):
             sys.exit(1)
     else:
-        client(argv[0], argv[1:])
-
-_PYCTL_HELP = """\
-pyctl -- pythond daemon control.
-
-  pyctl start [--show-token]               start daemon (local)
-  pyctl start --listen HOST:PORT [--tls]   start daemon (remote)
-  pyctl stop                               stop daemon gracefully
-  pyctl status                             daemon process info
-  pyctl connect <name> <host:port> <token> [--tls]
-                                           proxy to remote pythond daemon
-  pyctl disconnect <name>                  drop remote proxy
-  pyctl trust <cert.pem>                   let this client connect (server-side)
-  pyctl pin <cert.pem>                     verify this server is real (client-side)
-  pyctl cert                               show/generate this machine's cert
-  pyctl --version                          print version
-
-Architecture:
-  pysh   = send code to sessions (local or remote, transparent)
-  pyctl  = manage the daemon itself (start, stop, proxy, certs)
-  daemon = execute code + reverse-proxy to remote daemons
-"""
+        client(args.command, argv[1:])
 
 def pyctl_main() -> None:
     """Entry point for `pyctl` command -- daemon management."""
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
-        print(_PYCTL_HELP)
+    parser = argparse.ArgumentParser(
+        prog="pyctl",
+        description="pythond daemon control.",
+        epilog="pysh sends code; pyctl manages daemon lifecycle, proxy, and certs.",
+    )
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"pythond {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    p_start = sub.add_parser("start", help="start daemon")
+    p_start.add_argument("--listen", metavar="HOST:PORT")
+    p_start.add_argument("--tls", action="store_true")
+    p_start.add_argument("--show-token", action="store_true")
+    sub.add_parser("stop", help="stop daemon gracefully")
+    sub.add_parser("status", help="daemon process info")
+    p_connect = sub.add_parser("connect", help="proxy to remote daemon")
+    p_connect.add_argument("name")
+    p_connect.add_argument("addr", metavar="host:port")
+    p_connect.add_argument("token")
+    p_connect.add_argument("--tls", action="store_true")
+    p_disconnect = sub.add_parser("disconnect", help="drop remote proxy")
+    p_disconnect.add_argument("name")
+    p_trust = sub.add_parser("trust", help="trust a client cert")
+    p_trust.add_argument("cert", metavar="cert.pem")
+    p_pin = sub.add_parser("pin", help="pin a server cert")
+    p_pin.add_argument("cert", metavar="cert.pem")
+    sub.add_parser("cert", help="show/generate this machine's cert")
+
+    if not argv:
+        parser.print_help()
         sys.exit(0)
-    if argv[0] in ("--version", "-V", "version"):
+    if argv[0] == "version":
         print(f"pythond {__version__}")
         sys.exit(0)
-    if argv[0] == "start":
+
+    args = parser.parse_args(argv)
+    if args.command == "start":
         _mp_init()
-        show = "--show-token" in argv
-        listen = None
-        use_tls = "--tls" in argv
-        for i, a in enumerate(argv):
-            if a == "--listen" and i + 1 < len(argv):
-                listen = argv[i + 1]
-            elif a == "--listen":
-                print("ERR --listen requires HOST:PORT", file=sys.stderr)
-                sys.exit(1)
-        daemon(show_token=show, listen_addr=listen, tls=use_tls)
-    elif argv[0] == "stop":
-        client("stop", argv[1:], fail_on_err=True)
-    elif argv[0] == "connect":
-        # pyctl connect <name> <host:port> <token> [--tls]
-        # -> tells the daemon to proxy to a remote pythond
-        client("connect", argv[1:], fail_on_err=True)
-    elif argv[0] == "disconnect":
-        # pyctl disconnect <name>
-        # -> tells the daemon to drop a remote proxy
-        client("disconnect", argv[1:], fail_on_err=True)
-    elif argv[0] == "trust":
-        if len(argv) < 2:
-            print("usage: pyctl trust <cert.pem>  (let this client in)", file=sys.stderr)
-            sys.exit(1)
+        daemon(show_token=args.show_token, listen_addr=args.listen,
+               tls=args.tls)
+    elif args.command == "stop":
+        client("stop", [], fail_on_err=True)
+    elif args.command == "connect":
+        connect_args = [args.name, args.addr, args.token]
+        if args.tls:
+            connect_args.append("--tls")
+        client("connect", connect_args, fail_on_err=True)
+    elif args.command == "disconnect":
+        client("disconnect", [args.name], fail_on_err=True)
+    elif args.command == "trust":
         if not _HAS_CRYPTO:
             print("ERR: pip install pythond", file=sys.stderr)
             sys.exit(1)
         try:
-            dest, fp = trust_cert(argv[1], direction="client")
+            dest, fp = trust_cert(args.cert, direction="client")
         except RuntimeError as e:
             print(f"ERR {_public_error(e)}", file=sys.stderr)
             sys.exit(1)
         print(f"trusted client: {fp}")
         print(f"  -> {dest}")
-    elif argv[0] == "pin":
-        if len(argv) < 2:
-            print("usage: pyctl pin <cert.pem>  (verify this server)", file=sys.stderr)
-            sys.exit(1)
+    elif args.command == "pin":
         if not _HAS_CRYPTO:
             print("ERR: pip install pythond", file=sys.stderr)
             sys.exit(1)
         try:
-            dest, fp = trust_cert(argv[1], direction="server")
+            dest, fp = trust_cert(args.cert, direction="server")
         except RuntimeError as e:
             print(f"ERR {_public_error(e)}", file=sys.stderr)
             sys.exit(1)
         print(f"pinned server: {fp}")
         print(f"  -> {dest}")
-    elif argv[0] == "cert":
+    elif args.command == "cert":
         if not _HAS_CRYPTO:
             print("ERR: pip install pythond", file=sys.stderr)
             sys.exit(1)
@@ -2988,7 +3083,7 @@ def pyctl_main() -> None:
         print(f"fingerprint: {fp}")
         print(f"\nOn server:  pyctl trust {cert}")
         print(f"On client:  pyctl pin {cert}")
-    elif argv[0] == "status":
+    elif args.command == "status":
         meta = _read_daemon_meta()
         alive = False
         if _HAS_AF_UNIX:
@@ -3005,8 +3100,7 @@ def pyctl_main() -> None:
         if not alive:
             sys.exit(1)
     else:
-        print(f"ERR unknown pyctl command: {argv[0]}", file=sys.stderr)
-        print(_PYCTL_HELP, file=sys.stderr)
+        parser.print_help(sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

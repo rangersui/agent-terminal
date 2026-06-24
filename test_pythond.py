@@ -109,7 +109,7 @@ def test_parse_host_port_validation():
     check("parse default port",
           pythond._parse_host_port("example.com", default_port=1234) ==
           ("example.com", 1234))
-    for value in ("example.com:0", "example.com:65536"):
+    for value in ("example.com:0", "example.com:65536", ":8080"):
         try:
             pythond._parse_host_port(value)
             check(f"reject {value}", False)
@@ -831,6 +831,7 @@ def test_connection_hardening_static():
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
     private_dir_seg = src[src.index("def _ensure_private_dir("):src.index("def _session_dir(")]
     log_seg = src[src.index("def _log_history("):src.index("# -----------------------------------------------\n# SOCKET helpers")]
+    set_session_seg = src[src.index("def _set_session("):src.index("def _ensure_session_capacity(")]
     trust_cert_seg = src[src.index("def trust_cert("):src.index("class _Servable")]
     cert_dirs_seg = src[src.index("def _trusted_clients_dir("):src.index("def _load_trusted_certs(")]
     cert_gen_seg = src[src.index("def _generate_cert("):src.index("def _cert_fingerprint(")]
@@ -841,8 +842,11 @@ def test_connection_hardening_static():
     tls_server_seg = src[src.index("class _TlsTerminatedServer:"):src.index("# =============================================\n# SHARED WORKER LOGIC")]
     dispatch_seg = src[src.index("def _dispatch("):src.index("# =============================================\n# POSIX: real PTY worker")]
     monitor_seg = src[src.index("def _monitor_session("):src.index("def send_session(")]
+    recv_line_seg = src[src.index("def _recv_session_line("):src.index("def send_session(")]
+    kill_session_seg = src[src.index("def kill_session("):src.index("def _close_session_resources(")]
     send_session_seg = src[src.index("def send_session("):src.index("# -----------------------------------------------\n# REMOTE PROXY")]
     remote_seg = src[src.index("def _send_remote("):src.index("def connect_remote(")]
+    connect_remote_seg = src[src.index("def connect_remote("):src.index("def _handle_stop(")]
     wspro_seg = src[src.index("class _WsproClient"):src.index("def _connect_wss(")]
     parse_host_port_seg = src[src.index("def _parse_host_port("):src.index("def _open_remote_ws(")]
     resize_seg = src[src.index("def _handle_resize("):src.index("def _handle_ls(")]
@@ -855,7 +859,7 @@ def test_connection_hardening_static():
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
-    pysh_seg = src[src.index("def pysh_main("):src.index("_PYCTL_HELP")]
+    pysh_seg = src[src.index("def pysh_main("):src.index("def pyctl_main(")]
 
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
@@ -899,6 +903,9 @@ def test_connection_hardening_static():
           "TextMessage(data=data)" in wspro_seg and
           "TextMessage(data=str(data))" not in wspro_seg and
           "websocket payload must be str or bytes" in wspro_seg)
+    check("wsproto connect closes wrapped socket on failure",
+          "sock = None" in wspro_seg and
+          "if sock is not None:\n                sock.close()" in wspro_seg)
     check("wsproto close handles already closed state",
           "LocalProtocolError" in wspro_seg)
     check("wsproto close reply uses legal code",
@@ -918,12 +925,20 @@ def test_connection_hardening_static():
     check("TLS accept loop has timeout",
           "self._sock.settimeout(1.0)" in tls_server_seg and
           "except socket.timeout:" in tls_server_seg)
+    check("TLS bridge polls inner while TLS has pending data",
+          "tls_sock.pending()" in tls_server_seg and
+          "select.select([inner_sock], [], [], 0)" in tls_server_seg)
     check("handle_client uses dispatch table", "_CONTROL_HANDLERS.get(cmd)" in handle_seg)
     check("handle_client no elif chain", "elif cmd" not in handle_seg)
     check("runtime dir uses private helper", "_ensure_private_dir" in runtime_seg)
     check("tls dir uses private helper", "_ensure_private_dir" in tls_seg)
     check("private dir rejects insecure POSIX dirs",
           "os.lstat(path)" in private_dir_seg and "st.st_uid" in private_dir_seg)
+    check("private dir rejects Windows reparse points",
+          "GetFileAttributesW" in private_dir_seg and
+          "_WIN_FILE_ATTRIBUTE_REPARSE_POINT" in private_dir_seg)
+    check("windows path hardening catches icacls timeout",
+          "subprocess.TimeoutExpired" in src and "def _secure_path_win32" in src)
     check("log files are created private",
           "os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT" in log_seg and
           "0o600" in log_seg)
@@ -944,6 +959,12 @@ def test_connection_hardening_static():
           "_MAX_TLS_BRIDGE_THREADS" in tls_server_seg)
     check("new_session rolls back failed registration",
           "_close_session_resources(session)" in new_session_seg)
+    check("set_session closes replaced session",
+          "old_session = sessions.get(name)" in set_session_seg and
+          "_close_session_resources(old_session)" in set_session_seg)
+    check("winpty accept failures terminate spawned worker",
+          "except BaseException:" in new_session_seg and
+          "proc.terminate(force=True)" in new_session_seg)
     check("worker entry has environment capability",
           "_WORKER_ENV" in main_seg and
           "env={**os.environ, _WORKER_ENV: \"1\"}" in new_session_seg)
@@ -981,7 +1002,7 @@ def test_connection_hardening_static():
           "_SET_ASYNC_EXC(ctypes.c_ulong(tid), None)" in dispatch_seg and
           "ctypes.py_object(None)" not in dispatch_seg)
     check("fire publishes tid after start before cell visibility",
-          "t.start()" in dispatch_seg and
+          "with _cells_lock:\n            t.start()" in dispatch_seg and
           "res[\"tid\"] = t.ident" in dispatch_seg and
           "cells[cid] = res" in dispatch_seg)
     check("latest poll uses explicit cell sequence",
@@ -1000,17 +1021,27 @@ def test_connection_hardening_static():
     check("session command path avoids timeout-sensitive makefile",
           "makefile" not in send_session_seg and
           "_recv_session_line" in src)
+    check("recv_session_line preserves partial buffer",
+          "finally:\n        s[\"_ai_buf\"] = buf" in recv_line_seg)
+    check("kill_session has lock timeout",
+          "lock.acquire(timeout=3)" in kill_session_seg and
+          "_close_session_resources(s)" in kill_session_seg)
     check("timed out command channel stays unhealthy",
           "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
     check("remote does not retry after send",
           "remote response failed" in remote_seg and
           "remote send failed" in remote_seg and
           "if attempt == 0:\n                    continue" in remote_seg)
+    check("connect_remote does not kill before network IO",
+          "kill_session(name)" not in connect_remote_seg and
+          "_set_session(name" in connect_remote_seg)
     pre_host_seg = connect_daemon_seg.split("host = os.environ.get(\"PYTHOND_HOST\")", 1)[0]
     check("daemon connector delays websockets import",
           "from websockets.sync.client import unix_connect" not in pre_host_seg and
           connect_daemon_seg.index("if host:") <
           connect_daemon_seg.index("from websockets.sync.client import unix_connect"))
+    check("daemon connector validates fallback port",
+          "if not (1 <= port <= 65535):" in connect_daemon_seg)
     check("daemon server registered immediately",
           "def _set_server(" in daemon_full_seg and
           "_daemon_server = created" in daemon_full_seg and
@@ -1019,23 +1050,41 @@ def test_connection_hardening_static():
           "_daemon_token = None" in daemon_full_seg)
     check("mp init only on daemon entry points",
           main_seg.count("_mp_init()") == 1 and
-          "if argv[0] == \"daemon\":\n        _mp_init()" in main_seg and
+          "if args.command == \"daemon\":\n        _mp_init()" in main_seg and
           "_mp_init()" not in pysh_seg and
           pyctl_seg.count("_mp_init()") == 1 and
-          "if argv[0] == \"start\":\n        _mp_init()" in pyctl_seg)
+          "if args.command == \"start\":\n        _mp_init()" in pyctl_seg)
+    check("entry points use argparse",
+          "import argparse" in src and
+          "argparse.ArgumentParser" in main_seg and
+          "argparse.ArgumentParser" in pysh_seg and
+          "argparse.ArgumentParser" in pyctl_seg)
+    check("manual help strings removed",
+          "_PYSH_HELP" not in src and "_PYCTL_HELP" not in src)
     check("remote resize fails explicitly",
           "resize not supported for remote sessions" in resize_seg)
+    check("parse_host_port rejects empty host",
+          "if not host:" in parse_host_port_seg)
     check("attach reader uses bounded recv",
           "ws.recv(timeout=2)" in attach_reader_seg and
           "except (TimeoutError, socket.timeout):" in attach_reader_seg)
+    check("attach reader surfaces text errors",
+          "print(frame, file=sys.stderr)" in attach_reader_seg)
     check("attach preserves bytes before Ctrl-]",
           "data.partition(b\"\\x1d\")" in attach_loop_seg and
           "ws.send(before)" in attach_loop_seg)
+    check("attach waits reader before terminal restore",
+          "t.join(timeout=3)" in attach_loop_seg and
+          attach_loop_seg.index("t.join(timeout=3)") <
+          attach_loop_seg.index("restore_terminal()"))
     check("windows attach preserves processed input",
           "old_in.value | _WIN_ENABLE_PROCESSED_INPUT" in attach_win_seg)
     check("windows attach requires TTY",
           "sys.stdin.isatty()" in attach_win_seg and
           "attach requires a TTY" in attach_win_seg)
+    check("windows attach consumes extended key bytes together",
+          "first in (b\"\\x00\", b\"\\xe0\")" in attach_win_seg and
+          "return first + msvcrt.getch()" in attach_win_seg)
     check("windows attach clears line and echo input",
           "& ~0x0006" in attach_win_seg)
     check("client prints ERR to stderr",
@@ -1046,10 +1095,12 @@ def test_connection_hardening_static():
           "fail_on_err=True" in pyctl_seg)
     check("pyctl status exits nonzero when dead",
           "if not alive:" in pyctl_seg and "sys.exit(1)" in pyctl_seg)
+    check("pyctl has terminal fallback",
+          "parser.print_help(sys.stderr)" in pyctl_seg)
     check("unix socket created under private umask",
           "os.umask(0o177)" in src and "ws_unix_serve" in src)
-    check("malformed listen rejected",
-          "ERR --listen requires HOST:PORT" in src)
+    check("listen arg parsed by argparse",
+          "add_argument(\"--listen\", metavar=\"HOST:PORT\"" in src)
     check("client-visible runtime errors are sanitized",
           "_public_error(e)" in src and "return f\"ERR {e}\"" not in src)
 
