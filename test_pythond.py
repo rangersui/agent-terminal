@@ -618,6 +618,27 @@ def test_control_handler_exact_arity():
               "ERR usage"))
 
 
+def test_disconnect_identity_guard():
+    section("disconnect identity guard")
+    name = "__disconnect_toc__"
+    old_remote = {"type": "remote", "host": "old"}
+    new_remote = {"type": "remote", "host": "new"}
+    with pythond._sessions_lock:
+        pythond.sessions[name] = new_remote
+    try:
+        check("stale session object is not killed",
+              not pythond.kill_session_if_current(name, old_remote))
+        with pythond._sessions_lock:
+            check("replacement session remains", pythond.sessions.get(name) is new_remote)
+        check("disconnect removes current remote",
+              pythond._handle_disconnect([name]) == f"OK disconnected {name}")
+        with pythond._sessions_lock:
+            check("current remote removed", name not in pythond.sessions)
+    finally:
+        with pythond._sessions_lock:
+            pythond.sessions.pop(name, None)
+
+
 def test_resize_dead_pty_not_ok():
     section("resize dead PTY not OK")
     name = "__dead_resize__"
@@ -1135,8 +1156,10 @@ def test_connection_hardening_static():
     attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _worker_entry(")]
     eval_exec_seg = src[src.index("def _eval_exec_cell("):src.index("def _make_exec(")]
     handle_new_seg = src[src.index("def _handle_new("):src.index("def _handle_int(")]
+    handle_disconnect_seg = src[src.index("def _handle_disconnect("):src.index("def _handle_new(")]
     handle_ls_seg = src[src.index("def _handle_ls("):src.index("def _log_cell_launch(")]
     connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
+    pty_bridge_seg = src[src.index("class PtyBridge:"):src.index("def new_session(")]
     add_session_subparsers_seg = src[src.index("def _add_session_subparsers("):src.index("def main(")]
     default_sock_seg = src[src.index("def _default_sock("):src.index("SOCK =")]
     client_start = src.index("def client(")
@@ -1159,6 +1182,12 @@ def test_connection_hardening_static():
     check("attach terminal setup failure detaches",
           "ws.send(\"detach\")" in attach_seg and
           "return False" in attach_seg)
+    check("daemon acknowledges attach before scrollback",
+          "ws.send(\"OK attached\")\n"
+          "                        if not bridge.flush_scrollback(owner):" in daemon_full_seg)
+    check("PtyBridge buffers output until attach acknowledgement",
+          "_pending_send_fn" in pty_bridge_seg and
+          "def flush_scrollback(self, owner: object) -> bool:" in pty_bridge_seg)
     check("attach rejects binary handshake response",
           "isinstance(resp, bytes)" in attach_seg and
           "ERR invalid attach response" in attach_seg)
@@ -1373,6 +1402,9 @@ def test_connection_hardening_static():
     check("connect_remote does not kill before network IO",
           "kill_session(name)" not in connect_remote_seg and
           "_set_session(name" in connect_remote_seg)
+    check("disconnect removes only same session object",
+          "kill_session_if_current(name, s)" in handle_disconnect_seg and
+          "kill_session(name)" not in handle_disconnect_seg)
     check("connect_remote rejects close during probe",
           "if resp is _WS_CLOSE:" in connect_remote_seg and
           "remote closed during probe" in connect_remote_seg)
@@ -2305,7 +2337,9 @@ def test_unit_pty_bridge():
     check("first attach accepted", owner is not None)
     time.sleep(0.1)
 
-    # scrollback should have been flushed on attach
+    # scrollback is explicit so the daemon can acknowledge attach first
+    check("scrollback not flushed before ack", received == [])
+    check("scrollback flush accepted", owner is not None and bridge.flush_scrollback(owner))
     check("scrollback flushed", len(received) > 0)
     check("scrollback content", b"scrollback data" in b"".join(received),
           b"".join(received))
@@ -2335,6 +2369,9 @@ def test_unit_pty_bridge():
     owner = bridge.attach(lambda data: received.append(data))
     check("re-attach accepted", owner is not None)
     time.sleep(0.1)
+    check("re-attach scrollback not flushed before ack", received == [])
+    check("re-attach scrollback flush accepted",
+          owner is not None and bridge.flush_scrollback(owner))
     check("re-attach scrollback", b"after detach" in b"".join(received))
 
     bridge.detach(owner)
@@ -2483,6 +2520,7 @@ def main():
         test_cell_eviction,
         test_session_name_sanitization,
         test_control_handler_exact_arity,
+        test_disconnect_identity_guard,
         test_resize_dead_pty_not_ok,
         test_session_dir,
         test_session_capacity_limit,

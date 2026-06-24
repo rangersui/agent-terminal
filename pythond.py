@@ -1665,6 +1665,7 @@ class PtyBridge:
         self._read = pty_read
         self._write = pty_write
         self._send_fn: typing.Callable[[bytes], typing.Any] | None = None
+        self._pending_send_fn: typing.Callable[[bytes], typing.Any] | None = None
         self._close_fn: typing.Callable[[], typing.Any] | None = None
         self._owner: object | None = None
         self._lock = threading.Lock()
@@ -1677,15 +1678,26 @@ class PtyBridge:
         send_fn: typing.Callable[[bytes], typing.Any],
         close_fn: typing.Callable[[], typing.Any] | None = None,
     ) -> object | None:
-        """Attach one client. send_fn(bytes) sends binary data to client."""
-        scrollback = b""
+        """Reserve one attached client. Call flush_scrollback() after ack."""
         with self._lock:
-            if self._send_fn is not None:
+            if self._owner is not None:
                 return None
             owner = object()
-            self._send_fn = send_fn
+            self._pending_send_fn = send_fn
             self._close_fn = close_fn
             self._owner = owner
+        return owner
+
+    def flush_scrollback(self, owner: object) -> bool:
+        """Enable an attached client and flush buffered output after attach ack."""
+        scrollback = b""
+        send_fn = None
+        with self._lock:
+            if self._owner is not owner or self._pending_send_fn is None:
+                return False
+            send_fn = self._pending_send_fn
+            self._send_fn = send_fn
+            self._pending_send_fn = None
             if self._scrollback:
                 scrollback = bytes(self._scrollback)
                 self._scrollback.clear()
@@ -1693,14 +1705,14 @@ class PtyBridge:
             try:
                 send_fn(scrollback)
             except Exception:
+                close_fn = None
                 with self._lock:
                     if self._owner is owner:
-                        self._send_fn = None
-                        self._close_fn = None
-                        self._owner = None
                         self._buffer_scrollback_front_locked(scrollback)
-                return None
-        return owner
+                        close_fn = self._take_close_fn_locked(owner)
+                self._call_close_fn(close_fn)
+                return False
+        return True
 
     def _take_close_fn_locked(
         self,
@@ -1711,6 +1723,7 @@ class PtyBridge:
             return None
         close_fn = self._close_fn
         self._send_fn = None
+        self._pending_send_fn = None
         self._close_fn = None
         self._owner = None
         return close_fn
@@ -1923,6 +1936,28 @@ def kill_session(name: str) -> bool:
                 return False
             sessions.pop(name, None)
         return _close_session_resources(s)
+    finally:
+        lock.release()
+
+def kill_session_if_current(name: str, expected: JsonDict) -> bool:
+    """Kill name only if it still points at expected session object."""
+    lock = _session_lock(expected)
+    locked = lock.acquire(timeout=3)
+    if not locked:
+        should_close = False
+        with _sessions_lock:
+            if sessions.get(name) is expected:
+                sessions.pop(name, None)
+                should_close = True
+        if should_close:
+            return _close_session_resources(expected)
+        return False
+    try:
+        with _sessions_lock:
+            if sessions.get(name) is not expected:
+                return False
+            sessions.pop(name, None)
+        return _close_session_resources(expected)
     finally:
         lock.release()
 
@@ -2517,7 +2552,8 @@ def _handle_disconnect(args: list[str]) -> str:
         return f"ERR no session '{name}'"
     if s["type"] != "remote":
         return f"ERR '{name}' is local, use kill"
-    kill_session(name)
+    if not kill_session_if_current(name, s):
+        return f"ERR session '{name}' changed during disconnect"
     return f"OK disconnected {name}"
 
 
@@ -2888,6 +2924,10 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                         _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
                                     status="ok")
                         ws.send("OK attached")
+                        if not bridge.flush_scrollback(owner):
+                            _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                        status="scrollback-failed")
+                            return
                         for frame in ws:
                             if isinstance(frame, str):
                                 if frame.strip() in ("detach", ""):
