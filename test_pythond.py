@@ -7,6 +7,7 @@ Unit tests run everywhere.  Integration tests need POSIX (PTY) or TCP mode.
 """
 import json
 import io
+import contextlib
 import os
 import shutil
 import signal
@@ -791,6 +792,61 @@ def test_send_session_marks_large_response_unhealthy():
             pythond.sessions.pop(name, None)
 
 
+def test_ai_loop_survives_bad_messages():
+    section("AI loop survives bad messages")
+    ai_parent, ai_child = socket.socketpair()
+    stop = threading.Event()
+
+    def fake_interact(self, banner=None, exitmsg=None):
+        stop.wait(3)
+        raise SystemExit
+
+    original_dispatch = pythond._dispatch
+    def flaky_dispatch(cmd, args, _exec, cells, ns, lock=None):
+        if cmd == "boom":
+            raise RuntimeError("synthetic dispatch failure")
+        return original_dispatch(cmd, args, _exec, cells, ns, lock)
+
+    with mock.patch.object(pythond.code.InteractiveConsole, "interact",
+                           fake_interact), \
+         mock.patch.object(pythond, "_dispatch", side_effect=flaky_dispatch):
+        worker = threading.Thread(target=pythond.session_worker_pty,
+                                  args=(ai_child,), daemon=True)
+        worker.start()
+        rf = ai_parent.makefile("r", encoding="utf-8")
+        wf = ai_parent.makefile("w", encoding="utf-8")
+        try:
+            wf.write("{bad json\n")
+            wf.flush()
+            bad_json = json.loads(rf.readline())
+            check("bad json gets protocol error",
+                  bad_json == {"error": "worker protocol error"}, bad_json)
+
+            wf.write(json.dumps({"cmd": "boom", "args": []}) + "\n")
+            wf.flush()
+            dispatch_error = json.loads(rf.readline())
+            check("dispatch exception gets protocol error",
+                  dispatch_error == {"error": "worker protocol error"},
+                  dispatch_error)
+
+            wf.write(json.dumps({"cmd": "status", "args": []}) + "\n")
+            wf.flush()
+            status = json.loads(rf.readline())
+            check("AI loop still handles next command", status.get("state") == "idle",
+                  status)
+        finally:
+            stop.set()
+            with contextlib.suppress(Exception):
+                rf.close()
+            with contextlib.suppress(Exception):
+                wf.close()
+            with contextlib.suppress(Exception):
+                ai_parent.close()
+            worker.join(timeout=1)
+            check("AI child socket closed", ai_child.fileno() == -1,
+                  ai_child.fileno())
+
+
 def test_session_dir():
     section("_session_dir")
     name = "__test_session_dir__"
@@ -1320,6 +1376,7 @@ def test_connection_hardening_static():
     handle_ls_seg = src[src.index("def _handle_ls("):src.index("def _log_cell_launch(")]
     connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
     pty_bridge_seg = src[src.index("class PtyBridge:"):src.index("def new_session(")]
+    session_worker_seg = src[src.index("def session_worker_pty("):src.index("# =============================================\n# DAEMON")]
     add_session_subparsers_seg = src[src.index("def _add_session_subparsers("):src.index("def main(")]
     default_sock_seg = src[src.index("def _default_sock("):src.index("SOCK =")]
     tcp_alive_seg = src[src.index("def _tcp_daemon_alive("):src.index("def _unix_daemon_alive(")]
@@ -1570,6 +1627,12 @@ def test_connection_hardening_static():
           "_MAX_WORKER_RESPONSE" in src and
           "if len(buf) > _MAX_WORKER_RESPONSE:" in recv_line_seg and
           "worker response too large" in recv_line_seg)
+    check("AI loop keeps channel after recoverable errors",
+          session_worker_seg.count(
+              "except BaseException:\n                        break\n"
+              "                    continue") == 2)
+    check("AI loop closes underlying socket",
+          "ai_sock.close()" in session_worker_seg)
     check("kill_session has lock timeout",
           "lock.acquire(timeout=3)" in kill_session_seg and
           "should_close = False" in kill_session_seg and
@@ -2743,6 +2806,7 @@ def main():
         test_close_session_resources_idempotent_under_race,
         test_recv_session_line_response_limit,
         test_send_session_marks_large_response_unhealthy,
+        test_ai_loop_survives_bad_messages,
         test_session_dir,
         test_session_capacity_limit,
         test_log_history,

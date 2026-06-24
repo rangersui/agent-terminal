@@ -1600,19 +1600,22 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
                         wf.write(json.dumps({"error": "worker protocol error"}) + "\n")
                         wf.flush()
                     except BaseException:
-                        pass
-                    break
+                        break
+                    continue
                 except Exception:
                     try:
                         wf.write(json.dumps({"error": "worker protocol error"}) + "\n")
                         wf.flush()
                     except BaseException:
                         break
+                    continue
         finally:
             with contextlib.suppress(OSError):
                 rf.close()
             with contextlib.suppress(OSError):
                 wf.close()
+            with contextlib.suppress(OSError):
+                ai_sock.close()
 
     threading.Thread(target=_ai_loop, daemon=True).start()
 
