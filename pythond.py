@@ -1302,6 +1302,25 @@ def _dispatch(
                 lock.release()
             os.close(r_fd)
             try:
+                os.setsid()  # type: ignore[attr-defined]
+            except OSError:
+                try:
+                    payload = pickle.dumps({
+                        "output": "fork child setsid failed",
+                        "_error": True,
+                        "diff": {},
+                        "skipped": [],
+                    })
+                    _write_all(w_fd, payload)
+                except Exception:
+                    pass  # child is dying anyway
+                finally:
+                    try:
+                        os.close(w_fd)
+                    except OSError:
+                        pass
+                    os._exit(1)
+            try:
                 buf = io.StringIO()
                 sys.stdout = sys.stderr = buf  # capture all output
                 had_error = False
@@ -1348,6 +1367,7 @@ def _dispatch(
         # --- parent process ---
         os.close(w_fd)
         res = {"output": "", "status": "running", "pid": child_pid,
+               "pgid": child_pid,
                "_seq": next(_CELL_SEQ)}
         def _fork_monitor(r: JsonDict = res, fd: int = r_fd, pid: int = child_pid) -> None:
             """Read pipe first (unblocks child write), then reap child."""
@@ -1429,6 +1449,7 @@ def _dispatch(
                     continue
                 tid = r.get("tid")
                 pid = r.get("pid")
+                pgid = r.get("pgid")
                 if tid:
                     rc = _SET_ASYNC_EXC(
                         ctypes.c_ulong(tid),
@@ -1440,8 +1461,17 @@ def _dispatch(
                         threads += 1
                 elif pid:
                     try:
-                        os.kill(pid, signal.SIGKILL)  # type: ignore[attr-defined]
+                        if pgid:
+                            os.killpg(int(pgid), signal.SIGKILL)  # type: ignore[attr-defined]
+                        else:
+                            os.kill(pid, signal.SIGKILL)  # type: ignore[attr-defined]
                         processes += 1
+                    except ProcessLookupError:
+                        try:
+                            os.kill(pid, signal.SIGKILL)  # type: ignore[attr-defined]
+                            processes += 1
+                        except (OSError, ProcessLookupError):
+                            pass  # already dead
                     except (OSError, ProcessLookupError):
                         pass  # already dead
         return {"threads": threads, "processes": processes,
