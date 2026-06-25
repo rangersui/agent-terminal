@@ -2482,6 +2482,7 @@ class _WsproClient:
     def __init__(self, sock: SocketLike, ws: wsproto.WSConnection) -> None:
         self.sock = sock
         self.ws = ws
+        self._proto_lock = threading.RLock()
         self._text_parts: list[str] = []
         self._bytes_parts: list[bytes] = []
         self._pending_events: collections.deque[ws_events.Event] = collections.deque()
@@ -2538,13 +2539,14 @@ class _WsproClient:
             raise
 
     def send(self, data: str | bytes) -> None:
-        if isinstance(data, bytes):
-            payload = self.ws.send(ws_events.BytesMessage(data=data))
-        elif isinstance(data, str):
-            payload = self.ws.send(ws_events.TextMessage(data=data))
-        else:
-            raise TypeError("websocket payload must be str or bytes")
-        self.sock.sendall(payload)
+        with self._proto_lock:
+            if isinstance(data, bytes):
+                payload = self.ws.send(ws_events.BytesMessage(data=data))
+            elif isinstance(data, str):
+                payload = self.ws.send(ws_events.TextMessage(data=data))
+            else:
+                raise TypeError("websocket payload must be str or bytes")
+            self.sock.sendall(payload)
 
     def recv(self, timeout: float | None = None) -> str | bytes | object:
         old_timeout = self.sock.gettimeout()
@@ -2559,8 +2561,9 @@ class _WsproClient:
                 data = self.sock.recv(_BUFFER_CHUNK)
                 if not data:
                     raise RuntimeError("websocket closed")
-                self.ws.receive_data(data)
-                events = list(self.ws.events())
+                with self._proto_lock:
+                    self.ws.receive_data(data)
+                    events = list(self.ws.events())
                 for i, event in enumerate(events):
                     result = self._handle_event(event)
                     if result is not None:
@@ -2575,7 +2578,8 @@ class _WsproClient:
 
     def close(self) -> None:
         try:
-            self.sock.sendall(self.ws.send(ws_events.CloseConnection(code=1000)))
+            with self._proto_lock:
+                self.sock.sendall(self.ws.send(ws_events.CloseConnection(code=1000)))
         except (OSError, LocalProtocolError):
             pass
         try:
@@ -2606,15 +2610,19 @@ class _WsproClient:
             return None
         if isinstance(event, ws_events.CloseConnection):
             try:
-                self.sock.sendall(self.ws.send(ws_events.CloseConnection(
-                    code=1000,
-                )))
+                with self._proto_lock:
+                    self.sock.sendall(self.ws.send(ws_events.CloseConnection(
+                        code=1000,
+                    )))
             except (OSError, LocalProtocolError):
                 pass
             return _WS_CLOSE
         if isinstance(event, ws_events.Ping):
             try:
-                self.sock.sendall(self.ws.send(ws_events.Pong(payload=event.payload)))
+                with self._proto_lock:
+                    self.sock.sendall(
+                        self.ws.send(ws_events.Pong(payload=event.payload))
+                    )
             except (OSError, LocalProtocolError):
                 pass
             return None

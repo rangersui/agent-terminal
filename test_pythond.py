@@ -1694,6 +1694,10 @@ def test_connection_hardening_static():
           "collections.deque" in wspro_seg and
           "while self._pending_events:" in wspro_seg and
           "self._pending_events.extend(events[i + 1:])" in wspro_seg)
+    check("wsproto state is protocol-locked",
+          "self._proto_lock = threading.RLock()" in wspro_seg and
+          "with self._proto_lock:" in wspro_seg and
+          "self.ws.receive_data(data)" in wspro_seg)
     check("wsproto pong write is guarded",
           "ws_events.Pong" in wspro_seg and
           "except (OSError, LocalProtocolError):" in wspro_seg)
