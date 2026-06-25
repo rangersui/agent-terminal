@@ -1225,13 +1225,12 @@ def test_wire_message_parser_human_input():
 
 def test_raw_websocket_human_commands():
     section("raw websocket human commands")
-    check("empty command returns prompt",
-          pythond._WS_PROMPT == ">>>")
     help_resp = pythond.handle_client("help", [])
     check("help returns raw protocol help",
           "raw WebSocket protocol" in help_resp and
           "new <name>" in help_resp and
-          "run <name>" in help_resp)
+          "run <name>" in help_resp and
+          "Empty frames are ignored" in help_resp)
     check("help rejects args",
           pythond.handle_client("help", ["extra"]) == "ERR usage: help")
 
@@ -1747,6 +1746,16 @@ def test_connection_hardening_static():
           "threading.Thread(target=_delayed_shutdown" in src)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
+    check("server websocket closes carry code and reason",
+          "def _ws_close(" in src and
+          "_ws_close(ws, 1008, \"auth failed\")" in daemon_full_seg and
+          "_ws_close(ws, 1008, \"binary frame not allowed\")" in daemon_full_seg and
+          "_ws_close(ws, 1001, \"daemon stopping\")" in daemon_full_seg and
+          "close_after = (1011, \"internal error\")" in daemon_full_seg and
+          "_ws_close(ws, close_after[0], close_after[1])" in daemon_full_seg)
+    check("websocket close reason is protocol bounded",
+          "def _close_reason(" in src and "123" in src and
+          "reason=_close_reason(reason) or None" in wspro_seg)
     check("wsproto is used for WSS framing",
           "import wsproto" in src and "class _WsproClient" in src)
     check("raw WSS parser removed",
@@ -2238,6 +2247,9 @@ def test_connection_hardening_static():
           "session_name = args[0] if args else \"\"" in daemon_full_seg and
           "body_bytes=body_len" in daemon_full_seg and
           "detail=body" not in daemon_full_seg)
+    check("empty websocket frames are ignored without fake prompt",
+          "_WS_PROMPT" not in src and
+          "if not cmd:\n                    continue" in daemon_full_seg)
 
 def test_entry_points_exist():
     section("entry points")

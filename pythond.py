@@ -53,9 +53,13 @@ Daemon commands (pyctl / pythond):
 
 Protocol:
   WebSocket text frames.  First line = command + args (space-separated).
+  Inline form: "run work 1 + 1" -> "2"
+  Body form:   "run work\\nfor i in range(3):\\n    print(i)"
   After first newline = code body (Python source, never escaped).
-  Example: "run work\\nprint('hello')" -> "hello"
   Keep-alive: multiple commands per WebSocket connection.
+  This is message-framed, not a terminal stream. Empty frames are ignored.
+  Raw clients such as websocat are useful for protocol debugging; pysh/pyctl are
+  the normal user-facing clients.
 
 Transport:
   Local POSIX:   ws:// over AF_UNIX ($XDG_RUNTIME_DIR/pythond.sock) -- socket perms, no token.
@@ -202,7 +206,6 @@ def _protocol_version(version: str) -> str:
 # Version compatibility, not auth. Auth is token/TLS policy or AF_UNIX fs perms.
 _WS_PROTO: typing.Any = f"pythond.{_protocol_version(__version__)}"
 _WS_HELLO = "tis but a scratch"
-_WS_PROMPT = ">>>"
 _WS_HELP = f"""pythond {__version__} raw WebSocket protocol
 
 Commands:
@@ -224,7 +227,8 @@ Commands:
 
 Notes:
   pysh/pyctl prefixes are accepted but not required.
-  Empty input returns {_WS_PROMPT}.
+  WebSocket is message-framed, not a terminal stream.
+  Empty frames are ignored; no prompt is emitted.
 """
 _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
@@ -2730,10 +2734,15 @@ class _WsproClient:
             if timeout is not None:
                 self.sock.settimeout(old_timeout)
 
-    def close(self) -> None:
+    def close(self, code: int = 1000, reason: str = "") -> None:
         try:
             with self._proto_lock:
-                self.sock.sendall(self.ws.send(ws_events.CloseConnection(code=1000)))
+                self.sock.sendall(
+                    self.ws.send(ws_events.CloseConnection(
+                        code=code,
+                        reason=_close_reason(reason) or None,
+                    ))
+                )
         except (OSError, LocalProtocolError):
             pass
         try:
@@ -2767,6 +2776,7 @@ class _WsproClient:
                 with self._proto_lock:
                     self.sock.sendall(self.ws.send(ws_events.CloseConnection(
                         code=1000,
+                        reason=event.reason,
                     )))
             except (OSError, LocalProtocolError):
                 pass
@@ -2912,6 +2922,28 @@ def _parse_wire_message(raw: str) -> tuple[str, list[str], str, bool]:
     if has_body:
         args.append(body)
     return cmd, args, body, has_body
+
+
+def _close_reason(reason: str) -> str:
+    """Return a WebSocket close reason within the 123-byte protocol limit."""
+    data = reason.encode("utf-8", "replace")
+    if len(data) <= 123:
+        return reason
+    return data[:123].decode("utf-8", "ignore")
+
+
+def _ws_close(ws: WebSocketLike, code: int = 1000, reason: str = "") -> None:
+    """Close a WebSocket with code/reason, falling back for test doubles."""
+    reason = _close_reason(reason)
+    try:
+        ws.close(code, reason)
+    except TypeError:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _send_remote(
@@ -3381,6 +3413,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                         print(f"WARN: auth failure response failed: {e.__class__.__name__}",
                               file=sys.stderr)
                     print(f"WARN: auth rejected from {peer}", file=sys.stderr)
+                    _ws_close(ws, 1008, "auth failed")
                     return
                 _access_log("auth", conn_id=conn_id, peer=peer, status="ok")
             # keep-alive: handle multiple messages per connection
@@ -3389,11 +3422,11 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                     _access_log("command", conn_id=conn_id, peer=peer, status="rejected",
                                 detail="binary-frame")
                     ws.send("ERR binary frame not allowed in command mode")
-                    continue
+                    _ws_close(ws, 1008, "binary frame not allowed")
+                    return
                 # protocol: "cmd arg1 arg2\nbody"
                 cmd, args, body, has_body = _parse_wire_message(raw)
                 if not cmd:
-                    ws.send(_WS_PROMPT)
                     continue
                 session_name = args[0] if args else ""
                 body_len = len(body.encode("utf-8", "replace")) if has_body else 0
@@ -3438,7 +3471,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                                 ws.send(resize_resp)
                                 continue
                         owner = bridge.attach(lambda data: ws.send(data),
-                                              lambda: ws.close())
+                                              lambda: _ws_close(ws, 1000, "session killed"))
                         if owner is None:
                             _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
                                         status="busy")
@@ -3451,6 +3484,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                         if not bridge.flush_scrollback(owner):
                             _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
                                         status="scrollback-failed")
+                            _ws_close(ws, 1011, "attach failed")
                             return
                         for frame in ws:
                             if isinstance(frame, str):
@@ -3466,8 +3500,10 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                             ws.send("OK detached")
                         except Exception:
                             pass  # detach ack failed -- connection closing anyway
+                        _ws_close(ws, 1000, "detached")
                     return  # connection done after attach/detach
 
+                close_after: tuple[int, str] | None = None
                 try:
                     resp = handle_client(cmd, args)
                     status = "error" if resp.startswith("ERR ") else "ok"
@@ -3475,10 +3511,17 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                     traceback.print_exc(file=sys.stderr)
                     resp = "ERR internal error"
                     status = "internal-error"
+                    close_after = (1011, "internal error")
                 _access_log("result", conn_id=conn_id, peer=peer, cmd=cmd,
                             session=session_name, status=status)
                 try:
                     ws.send(resp or "")
+                    if cmd == "stop":
+                        _ws_close(ws, 1001, "daemon stopping")
+                        break
+                    if close_after is not None:
+                        _ws_close(ws, close_after[0], close_after[1])
+                        break
                 except Exception as e:
                     _access_log("result", conn_id=conn_id, peer=peer, cmd=cmd,
                                 session=session_name, status="send-failed",

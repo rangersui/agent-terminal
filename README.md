@@ -162,15 +162,47 @@ pysh fork work "model = train(data)"    # process — killable, pickles back
 WebSocket with newline-separated fields. Python code is never JSON-escaped.
 
 ```
+ws.send("run work 1 + 1")               → "2"
 ws.send("run work\nprint('hello')")     → "hello"
-ws.send("fire work\ntrain(epochs=50)")  → {"cell_id":"..."}
+ws.send("fire work train(epochs=50)")   → {"cell_id":"..."}
 ws.send("fork work\ntrain(epochs=50)")  → {"cell_id":"..."}
 ws.send("ls")                           → "  work: alive pid=123"
 ```
 
+Use inline form for simple one-line code: `run work 1 + 1`.
+Use body form when the code is multiline: `run work\n<python source>`.
+
 The protocol supports multiple commands on one WebSocket. The normal `pysh`
 CLI opens a short connection per command; `pyctl connect` keeps a remote proxy
 connection alive inside the local daemon.
+
+Raw WebSocket clients are useful for protocol debugging. They are not the main
+user interface; `pysh` and `pyctl` handle tokens, pinning, and local metadata.
+
+```bash
+# Example only: replace the token with your daemon token from daemon.json or --show-token.
+# Localhost only. Remote access should use wss:// with certificate pinning.
+npx wscat -c ws://127.0.0.1:7984 \
+  -s pythond.0.4 \
+  -H "Authorization: Bearer b50cdd77873efb989f9199a4e245b911"
+```
+
+`wscat` shows `>` for frames you send and `<` for frames from the daemon, which
+is useful when checking request/response direction. Once connected, send
+protocol messages directly, without a `pysh` prefix:
+
+```text
+ls
+new work
+run work
+1 + 1
+```
+
+WebSocket is message-framed, not a stream REPL. Empty messages are ignored; the
+daemon does not emit a fake prompt. Some tools display received frames without
+preserving visual newlines exactly; use `wscat` for a readable manual protocol
+check, or `websocat --jsonline` when you need machine-readable frame
+boundaries. Normal users should use `pysh`/`pyctl`.
 
 ## Transport
 
